@@ -550,15 +550,6 @@ async def slash_setleave(interaction: discord.Interaction, channel: discord.Text
     save_config(config)
     await interaction.response.send_message(f"✅ Leave channel set to {channel.mention}.")
 
-@bot.tree.command(name="setlevelchannel", description="Set the channel for level up messages")
-@app_commands.describe(channel="Channel")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_setlevelchannel(interaction: discord.Interaction, channel: discord.TextChannel):
-    guild_cfg = config.setdefault(str(interaction.guild.id), {})
-    guild_cfg["level_channel"] = str(channel.id)
-    save_config(config)
-    await interaction.response.send_message(f"✅ Level up messages will appear in {channel.mention}.")
-
 # ── INFO ──────────────────────────────────────
 @bot.tree.command(name="ping", description="Check bot latency")
 async def slash_ping(interaction: discord.Interaction):
