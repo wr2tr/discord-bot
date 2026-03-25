@@ -819,8 +819,7 @@ async def slash_coinbalance(interaction: discord.Interaction):
     coins_store = xp_data.setdefault("coins", {})
     uid = str(interaction.user.id)
     coins_store.setdefault(uid, 100)
-    await interaction.response.send_message(f"🪙 You have **{coins_store[uid]} coins**!
-Play `/slots` to win more or lose them all 😅")
+    await interaction.response.send_message(f"You have **{coins_store[uid]} coins**! Play `/slots` to win more or lose them all!")
 
 @bot.tree.command(name="givecoin", description="Give coins to another member")
 @app_commands.describe(member="Who to give to", amount="How many coins")
@@ -955,8 +954,7 @@ async def slash_whoinvoice(interaction: discord.Interaction):
                     member_list.append(m.display_name)
             embed.add_field(
                 name=f"🔊 {vc.name} ({len(vc.members)})",
-                value="
-".join(member_list),
+                value="\n".join(member_list),
                 inline=False
             )
     if not any_found:
