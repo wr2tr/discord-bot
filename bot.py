@@ -1,8 +1,9 @@
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
-import json, os, random, asyncio, datetime
+import json, os, random, re, datetime
 from datetime import timedelta
+import asyncio
 
 # ─────────────────────────────────────────────
 #  CONFIG
@@ -27,30 +28,25 @@ intents = discord.Intents.default()
 intents.members         = True
 intents.message_content = True
 intents.reactions       = True
+intents.voice_states    = True
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
 # In-memory stores
-warnings   = {}   # user_id -> [reasons]
-xp_data    = {}   # guild_id -> user_id -> {xp, level}
-economy    = {}   # user_id -> {coins, last_daily}
-afk_users  = {}   # user_id -> reason
-snipe_data = {}   # channel_id -> {content, author, time}
-reminders  = []   # [{user_id, channel_id, time, message}]
-giveaways  = {}   # message_id -> {prize, winners, end_time, channel_id}
+warnings    = {}   # user_id -> [reasons]
+xp_data     = {}   # guild_id -> user_id -> {xp, level}
+spam_track  = {}   # user_id -> [timestamps]
+recent_join = []   # list of join timestamps for anti-raid
+voice_track = {}   # user_id -> join datetime
 
-# ══════════════════════════════════════════════
-#  HELPERS
-# ══════════════════════════════════════════════
+BAD_WORDS = ["badword1", "badword2", "badword3"]  # ← Add your bad words here
 
 def get_xp(guild_id, user_id):
     return xp_data.setdefault(str(guild_id), {}).setdefault(str(user_id), {"xp": 0, "level": 1})
 
 def xp_for_level(level):
-    return level * 100
-
-def get_coins(user_id):
-    return economy.setdefault(str(user_id), {"coins": 0, "last_daily": None})
+    # Starts easy, gets exponentially harder
+    return int(100 * (1.4 ** (level - 1)))
 
 # ══════════════════════════════════════════════
 #  EVENTS
@@ -60,13 +56,69 @@ def get_coins(user_id):
 async def on_ready():
     bot.add_view(TicketButton())
     bot.add_view(CloseTicketButton())
-    check_reminders.start()
-    check_giveaways.start()
+    update_stats.start()
     await bot.tree.sync()
     print(f"Logged in as {bot.user} — All systems online!")
+@tasks.loop(minutes=10)
+async def update_stats():
+    for guild in bot.guilds:
+        guild_cfg = config.get(str(guild.id), {})
+        channels = guild_cfg.get("stats_channels", {})
+        if not channels:
+            continue
+        try:
+            total   = guild.member_count
+            humans  = sum(1 for m in guild.members if not m.bot)
+            bots    = sum(1 for m in guild.members if m.bot)
+            online  = sum(1 for m in guild.members if m.status != discord.Status.offline)
+
+            if channels.get("members"):
+                ch = guild.get_channel(int(channels["members"]))
+                if ch: await ch.edit(name=f"👥 Members: {total}")
+            if channels.get("humans"):
+                ch = guild.get_channel(int(channels["humans"]))
+                if ch: await ch.edit(name=f"👤 Humans: {humans}")
+            if channels.get("bots"):
+                ch = guild.get_channel(int(channels["bots"]))
+                if ch: await ch.edit(name=f"🤖 Bots: {bots}")
+            if channels.get("online"):
+                ch = guild.get_channel(int(channels["online"]))
+                if ch: await ch.edit(name=f"🟢 Online: {online}")
+        except Exception as e:
+            print(f"Stats update error: {e}")
+
+
 
 @bot.event
 async def on_member_join(member):
+    # ── Anti-Raid ────────────────────────────
+    guild_cfg_r = config.get(str(member.guild.id), {})
+    if guild_cfg_r.get("automod_antiraid", False):
+        now = datetime.datetime.utcnow()
+        recent_join.append(now)
+        recent_join[:] = [t for t in recent_join if (now - t).total_seconds() < 10]
+        if len(recent_join) >= 5:
+            try:
+                await member.kick(reason="Auto-mod: Possible raid detected")
+                log_ch_id = guild_cfg_r.get("log_channel")
+                if log_ch_id:
+                    lch = member.guild.get_channel(int(log_ch_id))
+                    if lch:
+                        await lch.send(f"🚨 Anti-raid kicked **{member}** — too many joins in 10 seconds!")
+                return
+            except:
+                pass
+    # ── Account age check (anti-raid) ──
+    if guild_cfg_r.get("automod_antiraid", False):
+        age = (datetime.datetime.utcnow() - member.created_at.replace(tzinfo=None)).days
+        min_age = guild_cfg_r.get("min_account_age", 7)
+        if age < min_age:
+            try:
+                await member.kick(reason=f"Auto-mod: Account too new ({age} days old)")
+                return
+            except:
+                pass
+
     guild_cfg = config.get(str(member.guild.id), {})
 
     autorole_id = os.getenv("AUTOROLE_ID") or guild_cfg.get("autorole")
@@ -95,46 +147,7 @@ async def on_member_remove(member):
         if channel:
             await channel.send(f"👋 **{member.display_name}** has left the server.")
 
-@bot.event
-async def on_message(message):
-    if message.author.bot:
-        return
 
-    # AFK check — mention of AFK user
-    for mention in message.mentions:
-        if mention.id in afk_users:
-            await message.channel.send(f"💤 **{mention.display_name}** is AFK: {afk_users[mention.id]}")
-
-    # Remove AFK if user sends a message
-    if message.author.id in afk_users:
-        del afk_users[message.author.id]
-        await message.channel.send(f"✅ Welcome back {message.author.mention}! AFK removed.")
-
-    # XP gain
-    if not message.guild:
-        return await bot.process_commands(message)
-    data = get_xp(message.guild.id, message.author.id)
-    data["xp"] += random.randint(5, 15)
-    if data["xp"] >= xp_for_level(data["level"]):
-        data["xp"] = 0
-        data["level"] += 1
-        guild_cfg = config.get(str(message.guild.id), {})
-        lvl_channel_id = guild_cfg.get("level_channel")
-        lvl_channel = message.guild.get_channel(int(lvl_channel_id)) if lvl_channel_id else message.channel
-        await lvl_channel.send(f"🎉 {message.author.mention} leveled up to **Level {data['level']}**!")
-
-    await bot.process_commands(message)
-
-@bot.event
-async def on_message_delete(message):
-    if message.author.bot:
-        return
-    snipe_data[message.channel.id] = {
-        "content": message.content,
-        "author": str(message.author),
-        "avatar": str(message.author.display_avatar.url),
-        "time": discord.utils.utcnow()
-    }
 
 @bot.event
 async def on_reaction_add(reaction, user):
@@ -164,47 +177,144 @@ async def on_reaction_remove(reaction, user):
             if role:
                 await user.remove_roles(role)
 
+
 # ══════════════════════════════════════════════
-#  BACKGROUND TASKS
+#  AUTO-MOD + XP ON MESSAGE
 # ══════════════════════════════════════════════
 
-@tasks.loop(seconds=30)
-async def check_reminders():
-    now = discord.utils.utcnow()
-    done = []
-    for r in reminders:
-        if now >= r["time"]:
-            channel = bot.get_channel(r["channel_id"])
-            if channel:
-                await channel.send(f"⏰ <@{r['user_id']}> Reminder: **{r['message']}**")
-            done.append(r)
-    for r in done:
-        reminders.remove(r)
+@bot.event
+async def on_message(message):
+    if message.author.bot or not message.guild:
+        await bot.process_commands(message)
+        return
 
-@tasks.loop(seconds=15)
-async def check_giveaways():
-    now = discord.utils.utcnow()
-    ended = []
-    for msg_id, g in giveaways.items():
-        if now >= g["end_time"]:
-            channel = bot.get_channel(g["channel_id"])
-            if channel:
+    guild_cfg = config.get(str(message.guild.id), {})
+    member = message.author
+
+    # ── Bad Word Filter ──────────────────────
+    if guild_cfg.get("automod_badwords", False):
+        content_lower = message.content.lower()
+        custom_words = guild_cfg.get("bad_words", [])
+        all_bad = BAD_WORDS + custom_words
+        if any(word in content_lower for word in all_bad):
+            try:
+                await message.delete()
+                warn_msg = await message.channel.send(f"🚫 {member.mention} Watch your language!", delete_after=5)
+                warnings.setdefault(member.id, []).append("Auto-mod: Bad word")
+            except:
+                pass
+            await bot.process_commands(message)
+            return
+
+    # ── Anti-Link ────────────────────────────
+    if guild_cfg.get("automod_antilink", False):
+        url_pattern = re.compile(r"(https?://|discord\.gg/|www\.)\S+")
+        if url_pattern.search(message.content):
+            if not member.guild_permissions.administrator:
                 try:
-                    msg = await channel.fetch_message(int(msg_id))
-                    reaction = discord.utils.get(msg.reactions, emoji="🎉")
-                    if reaction:
-                        users = [u async for u in reaction.users() if not u.bot]
-                        if users:
-                            winners = random.sample(users, min(g["winners"], len(users)))
-                            winner_mentions = ", ".join(w.mention for w in winners)
-                            await channel.send(f"🎉 Giveaway ended! Congratulations {winner_mentions}! You won **{g['prize']}**!")
-                        else:
-                            await channel.send(f"🎉 Giveaway ended but nobody entered for **{g['prize']}**.")
+                    await message.delete()
+                    await message.channel.send(f"🔗 {member.mention} Links are not allowed here!", delete_after=5)
                 except:
                     pass
-            ended.append(msg_id)
-    for m in ended:
-        del giveaways[m]
+                await bot.process_commands(message)
+                return
+
+    # ── Anti-Spam ────────────────────────────
+    if guild_cfg.get("automod_antispam", False):
+        now = datetime.datetime.utcnow()
+        uid = member.id
+        spam_track.setdefault(uid, [])
+        spam_track[uid] = [t for t in spam_track[uid] if (now - t).total_seconds() < 5]
+        spam_track[uid].append(now)
+        if len(spam_track[uid]) >= 5:
+            try:
+                await member.timeout(discord.utils.utcnow() + timedelta(minutes=2), reason="Auto-mod: Spamming")
+                await message.channel.send(f"🛑 {member.mention} has been muted for spamming!", delete_after=5)
+                spam_track[uid] = []
+            except:
+                pass
+            await bot.process_commands(message)
+            return
+
+    # ── XP Gain (1 XP per message, random bonus) ──
+    data = get_xp(message.guild.id, member.id)
+    gained = random.randint(1, 3)
+    data["xp"] += gained
+    needed = xp_for_level(data["level"])
+    if data["xp"] >= needed:
+        data["xp"] -= needed
+        data["level"] += 1
+        lvl_channel_id = guild_cfg.get("level_channel")
+        lvl_channel = message.guild.get_channel(int(lvl_channel_id)) if lvl_channel_id else message.channel
+        try:
+            await lvl_channel.send(f"🎉 {member.mention} leveled up to **Level {data['level']}**! Next level needs **{xp_for_level(data['level'])} XP**.")
+        except:
+            pass
+
+    await bot.process_commands(message)
+
+
+@bot.event
+async def on_member_join_antiraid(member):
+    pass  # handled inside on_member_join already
+
+
+
+# ══════════════════════════════════════════════
+#  VOICE XP
+# ══════════════════════════════════════════════
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if member.bot:
+        return
+
+    uid = member.id
+    now = datetime.datetime.utcnow()
+
+    # User joined a voice channel
+    if before.channel is None and after.channel is not None:
+        voice_track[uid] = now
+
+    # User left a voice channel
+    elif before.channel is not None and after.channel is None:
+        if uid in voice_track:
+            joined_at = voice_track.pop(uid)
+            minutes = (now - joined_at).total_seconds() / 60
+
+            # 1 XP per minute in voice, min 1 minute to count
+            if minutes >= 1 and member.guild:
+                earned = max(1, int(minutes * 1))
+                data = get_xp(member.guild.id, member.id)
+                data["xp"] += earned
+                needed = xp_for_level(data["level"])
+
+                guild_cfg = config.get(str(member.guild.id), {})
+
+                # Check level up
+                if data["xp"] >= needed:
+                    data["xp"] -= needed
+                    data["level"] += 1
+                    lvl_channel_id = guild_cfg.get("level_channel")
+                    if lvl_channel_id:
+                        lvl_channel = member.guild.get_channel(int(lvl_channel_id))
+                        if lvl_channel:
+                            try:
+                                await lvl_channel.send(f"🎉 {member.mention} leveled up to **Level {data['level']}** (from voice chat)!")
+                            except:
+                                pass
+
+                # Log to voice XP log channel if set
+                log_ch_id = guild_cfg.get("voice_xp_log")
+                if log_ch_id:
+                    log_ch = member.guild.get_channel(int(log_ch_id))
+                    if log_ch:
+                        try:
+                            await log_ch.send(
+                                f"🎙️ **{member.display_name}** spent **{int(minutes)}m** in voice and earned **+{earned} XP** (Level {data['level']})"
+                            )
+                        except:
+                            pass
 
 # ══════════════════════════════════════════════
 #  TICKET SYSTEM
@@ -498,99 +608,6 @@ async def slash_snipe(interaction: discord.Interaction):
     embed.set_footer(text="Deleted message")
     await interaction.response.send_message(embed=embed)
 
-# ── LEVELING ──────────────────────────────────
-@bot.tree.command(name="level", description="Check your or someone's level")
-@app_commands.describe(member="Member")
-async def slash_level(interaction: discord.Interaction, member: discord.Member = None):
-    member = member or interaction.user
-    data = get_xp(interaction.guild.id, member.id)
-    needed = xp_for_level(data["level"])
-    embed = discord.Embed(title=f"Level — {member.display_name}", color=discord.Color.gold())
-    embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="Level", value=data["level"], inline=True)
-    embed.add_field(name="XP",    value=f"{data['xp']} / {needed}", inline=True)
-    bar_filled = int((data["xp"] / needed) * 10)
-    bar = "█" * bar_filled + "░" * (10 - bar_filled)
-    embed.add_field(name="Progress", value=f"`{bar}`", inline=False)
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="leaderboard", description="Show the XP leaderboard")
-async def slash_leaderboard(interaction: discord.Interaction):
-    guild_xp = xp_data.get(str(interaction.guild.id), {})
-    sorted_users = sorted(guild_xp.items(), key=lambda x: (x[1]["level"], x[1]["xp"]), reverse=True)[:10]
-    embed = discord.Embed(title=f"🏆 XP Leaderboard — {interaction.guild.name}", color=discord.Color.gold())
-    medals = ["🥇", "🥈", "🥉"]
-    for i, (uid, d) in enumerate(sorted_users):
-        medal = medals[i] if i < 3 else f"{i+1}."
-        member = interaction.guild.get_member(int(uid))
-        name = member.display_name if member else f"User {uid}"
-        embed.add_field(name=f"{medal} {name}", value=f"Level {d['level']} • {d['xp']} XP", inline=False)
-    await interaction.response.send_message(embed=embed)
-
-# ── ECONOMY ───────────────────────────────────
-@bot.tree.command(name="balance", description="Check your coin balance")
-@app_commands.describe(member="Member")
-async def slash_balance(interaction: discord.Interaction, member: discord.Member = None):
-    member = member or interaction.user
-    data = get_coins(member.id)
-    embed = discord.Embed(title=f"💰 Balance — {member.display_name}", color=discord.Color.yellow())
-    embed.add_field(name="Coins", value=f"🪙 {data['coins']}", inline=True)
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="daily", description="Claim your daily coins")
-async def slash_daily(interaction: discord.Interaction):
-    data = get_coins(interaction.user.id)
-    now = discord.utils.utcnow()
-    last = data.get("last_daily")
-    if last:
-        last_dt = datetime.datetime.fromisoformat(last)
-        diff = now - last_dt.replace(tzinfo=datetime.timezone.utc)
-        if diff.total_seconds() < 86400:
-            remaining = 86400 - diff.total_seconds()
-            h, m = int(remaining // 3600), int((remaining % 3600) // 60)
-            return await interaction.response.send_message(f"⏰ Come back in **{h}h {m}m** for your daily!")
-    reward = random.randint(100, 500)
-    data["coins"] += reward
-    data["last_daily"] = now.isoformat()
-    await interaction.response.send_message(f"✅ You claimed your daily reward of **🪙 {reward} coins**! Total: {data['coins']}")
-
-@bot.tree.command(name="givemoney", description="Give coins to another member")
-@app_commands.describe(member="Member", amount="Amount")
-async def slash_givemoney(interaction: discord.Interaction, member: discord.Member, amount: int):
-    if amount <= 0:
-        return await interaction.response.send_message("❌ Amount must be positive.")
-    sender = get_coins(interaction.user.id)
-    if sender["coins"] < amount:
-        return await interaction.response.send_message("❌ You don't have enough coins!")
-    sender["coins"] -= amount
-    get_coins(member.id)["coins"] += amount
-    await interaction.response.send_message(f"✅ Gave **🪙 {amount}** to {member.mention}!")
-
-@bot.tree.command(name="gamble", description="Gamble your coins — double or nothing!")
-@app_commands.describe(amount="Amount to gamble")
-async def slash_gamble(interaction: discord.Interaction, amount: int):
-    if amount <= 0:
-        return await interaction.response.send_message("❌ Amount must be positive.")
-    data = get_coins(interaction.user.id)
-    if data["coins"] < amount:
-        return await interaction.response.send_message("❌ Not enough coins!")
-    win = random.random() > 0.5
-    if win:
-        data["coins"] += amount
-        await interaction.response.send_message(f"🎰 You won! **+🪙 {amount}**! New balance: {data['coins']}")
-    else:
-        data["coins"] -= amount
-        await interaction.response.send_message(f"🎰 You lost! **-🪙 {amount}**! New balance: {data['coins']}")
-
-@bot.tree.command(name="work", description="Work to earn some coins")
-async def slash_work(interaction: discord.Interaction):
-    data = get_coins(interaction.user.id)
-    jobs = ["programmer", "chef", "plumber", "streamer", "driver", "teacher", "doctor"]
-    job = random.choice(jobs)
-    earned = random.randint(20, 100)
-    data["coins"] += earned
-    await interaction.response.send_message(f"💼 You worked as a **{job}** and earned **🪙 {earned} coins**! Total: {data['coins']}")
-
 # ── FUN ───────────────────────────────────────
 @bot.tree.command(name="8ball", description="Ask the magic 8ball a question")
 @app_commands.describe(question="Your question")
@@ -609,206 +626,357 @@ async def slash_8ball(interaction: discord.Interaction, question: str):
     embed.add_field(name="Answer",   value=random.choice(responses), inline=False)
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="coinflip", description="Flip a coin")
-async def slash_coinflip(interaction: discord.Interaction):
-    result = random.choice(["Heads 🪙", "Tails 🦅"])
-    await interaction.response.send_message(f"🪙 The coin landed on **{result}**!")
 
-@bot.tree.command(name="dice", description="Roll a dice")
-@app_commands.describe(sides="Number of sides (default 6)")
-async def slash_dice(interaction: discord.Interaction, sides: int = 6):
-    result = random.randint(1, sides)
-    await interaction.response.send_message(f"🎲 You rolled a **{result}** (d{sides})!")
-
-@bot.tree.command(name="rps", description="Play Rock Paper Scissors")
-@app_commands.describe(choice="Your choice")
-@app_commands.choices(choice=[
-    app_commands.Choice(name="Rock 🪨", value="rock"),
-    app_commands.Choice(name="Paper 📄", value="paper"),
-    app_commands.Choice(name="Scissors ✂️", value="scissors"),
+# ── AUTO-MOD SETUP ────────────────────────────
+@bot.tree.command(name="automod", description="Toggle auto-mod features on or off")
+@app_commands.describe(
+    feature="Which feature to toggle",
+    enabled="Turn on or off"
+)
+@app_commands.choices(feature=[
+    app_commands.Choice(name="Bad Word Filter", value="automod_badwords"),
+    app_commands.Choice(name="Anti-Link",       value="automod_antilink"),
+    app_commands.Choice(name="Anti-Spam",       value="automod_antispam"),
+    app_commands.Choice(name="Anti-Raid",       value="automod_antiraid"),
 ])
-async def slash_rps(interaction: discord.Interaction, choice: str):
-    bot_choice = random.choice(["rock", "paper", "scissors"])
-    emojis = {"rock": "🪨", "paper": "📄", "scissors": "✂️"}
-    wins = {"rock": "scissors", "paper": "rock", "scissors": "paper"}
-    if choice == bot_choice:
-        result = "It's a tie! 🤝"
-    elif wins[choice] == bot_choice:
-        result = "You win! 🎉"
-    else:
-        result = "You lose! 😔"
-    await interaction.response.send_message(f"You: {emojis[choice]} vs Bot: {emojis[bot_choice]}\n**{result}**")
-
-@bot.tree.command(name="joke", description="Get a random joke")
-async def slash_joke(interaction: discord.Interaction):
-    jokes = [
-        ("Why don't scientists trust atoms?", "Because they make up everything!"),
-        ("Why did the scarecrow win an award?", "Because he was outstanding in his field!"),
-        ("I told my wife she was drawing her eyebrows too high.", "She looked surprised."),
-        ("Why don't eggs tell jokes?", "They'd crack each other up!"),
-        ("What do you call a fish without eyes?", "A fsh!"),
-        ("Why can't you give Elsa a balloon?", "Because she'll let it go!"),
-        ("What's a computer's favorite snack?", "Microchips!"),
-    ]
-    setup, punchline = random.choice(jokes)
-    embed = discord.Embed(title="😂 Joke", color=discord.Color.yellow())
-    embed.add_field(name=setup, value=f"||{punchline}||", inline=False)
-    embed.set_footer(text="Click the spoiler to reveal the punchline!")
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="fact", description="Get a random fun fact")
-async def slash_fact(interaction: discord.Interaction):
-    facts = [
-        "Honey never spoils. Archaeologists have found 3000-year-old honey in Egyptian tombs!",
-        "A group of flamingos is called a flamboyance.",
-        "Octopuses have three hearts and blue blood.",
-        "Bananas are berries, but strawberries are not.",
-        "A day on Venus is longer than a year on Venus.",
-        "The shortest war in history was between Britain and Zanzibar in 1896 — it lasted 38 minutes.",
-        "Cows have best friends and get stressed when separated.",
-        "A snail can sleep for 3 years.",
-        "There are more stars in the universe than grains of sand on Earth.",
-    ]
-    embed = discord.Embed(title="🧠 Fun Fact", description=random.choice(facts), color=discord.Color.blue())
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="roast", description="Roast a member (all in good fun!)")
-@app_commands.describe(member="Member to roast")
-async def slash_roast(interaction: discord.Interaction, member: discord.Member):
-    roasts = [
-        "is so slow, they make a sloth look like a Formula 1 car.",
-        "tried to enter a smart room and the door wouldn't open.",
-        "has a face only a mother could love — and even she needs glasses.",
-        "is the reason they put instructions on shampoo bottles.",
-        "would need a map to find their way out of an empty room.",
-        "brings so little to the table, they need a booster seat.",
-    ]
-    await interaction.response.send_message(f"🔥 {member.mention} {random.choice(roasts)}")
-
-@bot.tree.command(name="compliment", description="Compliment a member")
-@app_commands.describe(member="Member to compliment")
-async def slash_compliment(interaction: discord.Interaction, member: discord.Member):
-    compliments = [
-        "is an absolute legend!",
-        "brings sunshine to even the cloudiest days! ☀️",
-        "is one of the most genuinely awesome people around!",
-        "makes this server 10x better just by being here!",
-        "has an amazing vibe and we're lucky to have them!",
-        "is the definition of cool. Facts only. 😎",
-    ]
-    await interaction.response.send_message(f"💖 {member.mention} {random.choice(compliments)}")
-
-@bot.tree.command(name="howcool", description="Check how cool someone is")
-@app_commands.describe(member="Member")
-async def slash_howcool(interaction: discord.Interaction, member: discord.Member = None):
-    member = member or interaction.user
-    score = random.randint(0, 100)
-    await interaction.response.send_message(f"😎 {member.mention} is **{score}% cool!**")
-
-@bot.tree.command(name="ship", description="Ship two people together")
-@app_commands.describe(member1="First person", member2="Second person")
-async def slash_ship(interaction: discord.Interaction, member1: discord.Member, member2: discord.Member):
-    score = random.randint(0, 100)
-    hearts = "❤️" * (score // 20)
-    await interaction.response.send_message(f"💘 **{member1.display_name}** + **{member2.display_name}** = **{score}% compatible!** {hearts}")
-
-# ── UTILITY ───────────────────────────────────
-@bot.tree.command(name="poll", description="Create a poll")
-@app_commands.describe(question="Poll question", option1="Option 1", option2="Option 2", option3="Option 3 (optional)", option4="Option 4 (optional)")
-async def slash_poll(interaction: discord.Interaction, question: str, option1: str, option2: str, option3: str = None, option4: str = None):
-    options = [o for o in [option1, option2, option3, option4] if o]
-    emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"]
-    embed = discord.Embed(title=f"📊 {question}", color=discord.Color.blurple())
-    for i, opt in enumerate(options):
-        embed.add_field(name=f"{emojis[i]} {opt}", value="\u200b", inline=False)
-    embed.set_footer(text=f"Poll by {interaction.user.display_name}")
-    await interaction.response.send_message(embed=embed)
-    msg = await interaction.original_response()
-    for i in range(len(options)):
-        await msg.add_reaction(emojis[i])
-
-@bot.tree.command(name="announce", description="Send an announcement embed")
-@app_commands.describe(channel="Channel", title="Title", message="Message", color="Color (red/green/blue/yellow/default)")
-@app_commands.checks.has_permissions(manage_messages=True)
-async def slash_announce(interaction: discord.Interaction, channel: discord.TextChannel, title: str, message: str, color: str = "blue"):
-    colors = {"red": discord.Color.red(), "green": discord.Color.green(), "blue": discord.Color.blue(), "yellow": discord.Color.yellow(), "default": discord.Color.blurple()}
-    c = colors.get(color.lower(), discord.Color.blurple())
-    embed = discord.Embed(title=title, description=message, color=c, timestamp=discord.utils.utcnow())
-    embed.set_footer(text=f"Announced by {interaction.user.display_name}")
-    await channel.send(embed=embed)
-    await interaction.response.send_message(f"✅ Announcement sent to {channel.mention}!", ephemeral=True)
-
-@bot.tree.command(name="remind", description="Set a reminder")
-@app_commands.describe(minutes="Minutes from now", message="What to remind you about")
-async def slash_remind(interaction: discord.Interaction, minutes: int, message: str):
-    remind_time = discord.utils.utcnow() + timedelta(minutes=minutes)
-    reminders.append({"user_id": interaction.user.id, "channel_id": interaction.channel.id, "time": remind_time, "message": message})
-    await interaction.response.send_message(f"⏰ I'll remind you about **{message}** in {minutes} minute(s)!", ephemeral=True)
-
-@bot.tree.command(name="afk", description="Set your AFK status")
-@app_commands.describe(reason="Reason for being AFK")
-async def slash_afk(interaction: discord.Interaction, reason: str = "AFK"):
-    afk_users[interaction.user.id] = reason
-    await interaction.response.send_message(f"💤 {interaction.user.mention} is now AFK: **{reason}**")
-
-@bot.tree.command(name="giveaway", description="Start a giveaway")
-@app_commands.describe(channel="Channel", prize="What you're giving away", minutes="Duration in minutes", winners="Number of winners")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def slash_giveaway(interaction: discord.Interaction, channel: discord.TextChannel, prize: str, minutes: int, winners: int = 1):
-    end_time = discord.utils.utcnow() + timedelta(minutes=minutes)
-    embed = discord.Embed(title="🎉 GIVEAWAY!", description=f"**Prize:** {prize}\n\n**Winners:** {winners}\n**Ends in:** {minutes} minute(s)\n\nReact with 🎉 to enter!", color=discord.Color.gold(), timestamp=end_time)
-    embed.set_footer(text=f"Ends at")
-    msg = await channel.send(embed=embed)
-    await msg.add_reaction("🎉")
-    giveaways[str(msg.id)] = {"prize": prize, "winners": winners, "end_time": end_time, "channel_id": channel.id}
-    await interaction.response.send_message(f"✅ Giveaway started in {channel.mention}!", ephemeral=True)
-
-@bot.tree.command(name="reactionrole", description="Add a reaction role to a message")
-@app_commands.describe(message_id="Message ID", emoji="Emoji to react with", role="Role to give")
 @app_commands.checks.has_permissions(administrator=True)
-async def slash_reactionrole(interaction: discord.Interaction, message_id: str, emoji: str, role: discord.Role):
+async def slash_automod(interaction: discord.Interaction, feature: str, enabled: bool):
     guild_cfg = config.setdefault(str(interaction.guild.id), {})
-    rr = guild_cfg.setdefault("reaction_roles", {})
-    rr.setdefault(message_id, {})[emoji] = str(role.id)
+    guild_cfg[feature] = enabled
     save_config(config)
-    try:
-        msg = await interaction.channel.fetch_message(int(message_id))
-        await msg.add_reaction(emoji)
-    except:
-        pass
-    await interaction.response.send_message(f"✅ Reaction role set! React with {emoji} to get **{role.name}**.", ephemeral=True)
+    status = "✅ Enabled" if enabled else "❌ Disabled"
+    names = {"automod_badwords": "Bad Word Filter", "automod_antilink": "Anti-Link", "automod_antispam": "Anti-Spam", "automod_antiraid": "Anti-Raid"}
+    await interaction.response.send_message(f"{status} **{names[feature]}**!")
 
-@bot.tree.command(name="embed", description="Send a custom embed message")
-@app_commands.describe(channel="Channel", title="Title", description="Description", color="Color (red/green/blue/yellow)")
-@app_commands.checks.has_permissions(manage_messages=True)
-async def slash_embed(interaction: discord.Interaction, channel: discord.TextChannel, title: str, description: str, color: str = "blue"):
-    colors = {"red": discord.Color.red(), "green": discord.Color.green(), "blue": discord.Color.blue(), "yellow": discord.Color.yellow()}
-    c = colors.get(color.lower(), discord.Color.blue())
-    embed = discord.Embed(title=title, description=description, color=c)
-    await channel.send(embed=embed)
-    await interaction.response.send_message("✅ Embed sent!", ephemeral=True)
+@bot.tree.command(name="addbadword", description="Add a word to the bad word filter")
+@app_commands.describe(word="Word to block")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_addbadword(interaction: discord.Interaction, word: str):
+    guild_cfg = config.setdefault(str(interaction.guild.id), {})
+    bad = guild_cfg.setdefault("bad_words", [])
+    if word.lower() not in bad:
+        bad.append(word.lower())
+        save_config(config)
+    await interaction.response.send_message(f"✅ Added **{word}** to the bad word filter.", ephemeral=True)
 
-@bot.tree.command(name="say", description="Make the bot say something")
-@app_commands.describe(channel="Channel", message="Message")
-@app_commands.checks.has_permissions(manage_messages=True)
-async def slash_say(interaction: discord.Interaction, channel: discord.TextChannel, message: str):
-    await channel.send(message)
-    await interaction.response.send_message("✅ Message sent!", ephemeral=True)
+@bot.tree.command(name="removebadword", description="Remove a word from the bad word filter")
+@app_commands.describe(word="Word to remove")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_removebadword(interaction: discord.Interaction, word: str):
+    guild_cfg = config.setdefault(str(interaction.guild.id), {})
+    bad = guild_cfg.get("bad_words", [])
+    if word.lower() in bad:
+        bad.remove(word.lower())
+        save_config(config)
+        await interaction.response.send_message(f"✅ Removed **{word}** from the filter.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"❌ **{word}** is not in the filter.", ephemeral=True)
 
-# ── HELP ──────────────────────────────────────
+@bot.tree.command(name="setminaccountage", description="Set minimum account age in days to join (anti-raid)")
+@app_commands.describe(days="Minimum age in days")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_setminaccountage(interaction: discord.Interaction, days: int):
+    guild_cfg = config.setdefault(str(interaction.guild.id), {})
+    guild_cfg["min_account_age"] = days
+    save_config(config)
+    await interaction.response.send_message(f"✅ Minimum account age set to **{days} days**.")
+
+@bot.tree.command(name="automodstatus", description="Show current auto-mod settings")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_automodstatus(interaction: discord.Interaction):
+    guild_cfg = config.get(str(interaction.guild.id), {})
+    def status(key): return "✅ On" if guild_cfg.get(key, False) else "❌ Off"
+    embed = discord.Embed(title="🛡️ Auto-Mod Status", color=discord.Color.blue())
+    embed.add_field(name="Bad Word Filter", value=status("automod_badwords"), inline=True)
+    embed.add_field(name="Anti-Link",       value=status("automod_antilink"), inline=True)
+    embed.add_field(name="Anti-Spam",       value=status("automod_antispam"), inline=True)
+    embed.add_field(name="Anti-Raid",       value=status("automod_antiraid"), inline=True)
+    embed.add_field(name="Min Account Age", value=f"{guild_cfg.get('min_account_age', 7)} days", inline=True)
+    custom_words = guild_cfg.get("bad_words", [])
+    embed.add_field(name="Custom Bad Words", value=", ".join(custom_words) if custom_words else "None", inline=False)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="setlogchannel", description="Set a channel for auto-mod logs")
+@app_commands.describe(channel="Log channel")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_setlogchannel(interaction: discord.Interaction, channel: discord.TextChannel):
+    guild_cfg = config.setdefault(str(interaction.guild.id), {})
+    guild_cfg["log_channel"] = str(channel.id)
+    save_config(config)
+    await interaction.response.send_message(f"✅ Log channel set to {channel.mention}.")
+
+# ── XP / LEVELING ─────────────────────────────
+@bot.tree.command(name="level", description="Check your or someone's level and XP")
+@app_commands.describe(member="Member to check")
+async def slash_level(interaction: discord.Interaction, member: discord.Member = None):
+    member = member or interaction.user
+    data = get_xp(interaction.guild.id, member.id)
+    needed = xp_for_level(data["level"])
+    bar_filled = int((data["xp"] / needed) * 10)
+    bar = "█" * bar_filled + "░" * (10 - bar_filled)
+    embed = discord.Embed(title=f"📈 Level — {member.display_name}", color=discord.Color.gold())
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Level",    value=f"**{data['level']}**",          inline=True)
+    embed.add_field(name="XP",       value=f"{data['xp']} / {needed}",      inline=True)
+    embed.add_field(name="Progress", value=f"`{bar}`",                      inline=False)
+    embed.add_field(name="Next level needs", value=f"{needed - data['xp']} more XP", inline=False)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="leaderboard", description="Show the XP leaderboard")
+async def slash_leaderboard(interaction: discord.Interaction):
+    guild_xp = xp_data.get(str(interaction.guild.id), {})
+    if not guild_xp:
+        return await interaction.response.send_message("❌ No XP data yet!")
+    sorted_users = sorted(guild_xp.items(), key=lambda x: (x[1]["level"], x[1]["xp"]), reverse=True)[:10]
+    embed = discord.Embed(title=f"🏆 XP Leaderboard — {interaction.guild.name}", color=discord.Color.gold())
+    medals = ["🥇", "🥈", "🥉"]
+    for i, (uid, d) in enumerate(sorted_users):
+        medal = medals[i] if i < 3 else f"**{i+1}.**"
+        m = interaction.guild.get_member(int(uid))
+        name = m.display_name if m else f"User {uid}"
+        embed.add_field(name=f"{medal} {name}", value=f"Level {d['level']} • {d['xp']} XP", inline=False)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="setlevelchannel", description="Set the channel for level-up messages")
+@app_commands.describe(channel="Channel")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_setlevelchannel(interaction: discord.Interaction, channel: discord.TextChannel):
+    guild_cfg = config.setdefault(str(interaction.guild.id), {})
+    guild_cfg["level_channel"] = str(channel.id)
+    save_config(config)
+    await interaction.response.send_message(f"✅ Level-up messages will appear in {channel.mention}.")
+
+@bot.tree.command(name="resetxp", description="Reset XP for a member")
+@app_commands.describe(member="Member to reset")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_resetxp(interaction: discord.Interaction, member: discord.Member):
+    xp_data.get(str(interaction.guild.id), {}).pop(str(member.id), None)
+    await interaction.response.send_message(f"✅ Reset XP for **{member.display_name}**.")
+
+
+# ── SLOT MACHINE ──────────────────────────────
+@bot.tree.command(name="slots", description="Play the slot machine! (costs 10 coins to play)")
+@app_commands.describe(bet="How many coins to bet (min 10)")
+async def slash_slots(interaction: discord.Interaction, bet: int = 10):
+    from discord.ext import commands
+    if bet < 10:
+        return await interaction.response.send_message("❌ Minimum bet is **10 coins**!", ephemeral=True)
+
+    # Simple coin store per user
+    coins_store = xp_data.setdefault("coins", {})
+    uid = str(interaction.user.id)
+    coins_store.setdefault(uid, 100)  # start with 100 coins
+
+    if coins_store[uid] < bet:
+        return await interaction.response.send_message(f"❌ You only have **🪙 {coins_store[uid]} coins**!", ephemeral=True)
+
+    slots = ["🍒", "🍋", "🍊", "🍇", "⭐", "💎", "7️⃣"]
+    weights = [30, 25, 20, 15, 5, 3, 2]  # rarer symbols = lower weight
+
+    import random as _r
+    reel1 = _r.choices(slots, weights=weights)[0]
+    reel2 = _r.choices(slots, weights=weights)[0]
+    reel3 = _r.choices(slots, weights=weights)[0]
+
+    display = f"┃ {reel1} ┃ {reel2} ┃ {reel3} ┃"
+
+    multipliers = {
+        "💎": 50, "7️⃣": 25, "⭐": 10,
+        "🍇": 5,  "🍊": 4,  "🍋": 3, "🍒": 2
+    }
+
+    coins_store[uid] -= bet
+
+    if reel1 == reel2 == reel3:
+        mult = multipliers.get(reel1, 2)
+        winnings = bet * mult
+        coins_store[uid] += winnings
+        result = f"🎉 **JACKPOT! {reel1}{reel1}{reel1}** — You won **🪙 {winnings} coins** (x{mult})!"
+        color = discord.Color.gold()
+    elif reel1 == reel2 or reel2 == reel3:
+        winnings = bet * 2
+        coins_store[uid] += winnings
+        result = f"✨ **Two of a kind!** — You won **🪙 {winnings} coins** (x2)!"
+        color = discord.Color.green()
+    elif reel1 == "🍒" or reel2 == "🍒" or reel3 == "🍒":
+        winnings = int(bet * 0.5)
+        coins_store[uid] += winnings
+        result = f"🍒 **Cherry bonus!** — You got back **🪙 {winnings} coins**."
+        color = discord.Color.orange()
+    else:
+        result = f"😔 **No match!** — You lost **🪙 {bet} coins**."
+        color = discord.Color.red()
+
+    embed = discord.Embed(title="🎰 Slot Machine", color=color)
+    embed.add_field(name="Reels", value=f"```{display}```", inline=False)
+    embed.add_field(name="Result", value=result, inline=False)
+    embed.add_field(name="Balance", value=f"🪙 {coins_store[uid]} coins", inline=False)
+    embed.set_footer(text="💎=x50 | 7️⃣=x25 | ⭐=x10 | 🍇=x5 | 🍊=x4 | 🍋=x3 | 🍒=x2")
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="coinbalance", description="Check your slot machine coin balance")
+async def slash_coinbalance(interaction: discord.Interaction):
+    coins_store = xp_data.setdefault("coins", {})
+    uid = str(interaction.user.id)
+    coins_store.setdefault(uid, 100)
+    await interaction.response.send_message(f"🪙 You have **{coins_store[uid]} coins**!
+Play `/slots` to win more or lose them all 😅")
+
+@bot.tree.command(name="givecoin", description="Give coins to another member")
+@app_commands.describe(member="Who to give to", amount="How many coins")
+async def slash_givecoin(interaction: discord.Interaction, member: discord.Member, amount: int):
+    if amount <= 0:
+        return await interaction.response.send_message("❌ Amount must be positive!", ephemeral=True)
+    coins_store = xp_data.setdefault("coins", {})
+    giver = str(interaction.user.id)
+    receiver = str(member.id)
+    coins_store.setdefault(giver, 100)
+    coins_store.setdefault(receiver, 100)
+    if coins_store[giver] < amount:
+        return await interaction.response.send_message(f"❌ You only have **🪙 {coins_store[giver]}**!", ephemeral=True)
+    coins_store[giver] -= amount
+    coins_store[receiver] += amount
+    await interaction.response.send_message(f"✅ Gave **🪙 {amount} coins** to {member.mention}! They now have {coins_store[receiver]} coins.")
+
+@bot.tree.command(name="daily", description="Claim your daily coins (resets every 24h)")
+async def slash_daily(interaction: discord.Interaction):
+    coins_store = xp_data.setdefault("coins", {})
+    daily_store = xp_data.setdefault("daily", {})
+    uid = str(interaction.user.id)
+    coins_store.setdefault(uid, 100)
+    now = datetime.datetime.utcnow()
+    last = daily_store.get(uid)
+    if last:
+        last_dt = datetime.datetime.fromisoformat(last)
+        diff = (now - last_dt).total_seconds()
+        if diff < 86400:
+            h = int((86400 - diff) // 3600)
+            m = int(((86400 - diff) % 3600) // 60)
+            return await interaction.response.send_message(f"⏰ Come back in **{h}h {m}m** for your daily coins!", ephemeral=True)
+    reward = random.randint(50, 200)
+    coins_store[uid] += reward
+    daily_store[uid] = now.isoformat()
+    await interaction.response.send_message(f"✅ You claimed **🪙 {reward} daily coins**! Balance: {coins_store[uid]}")
+
+# ── SERVER STATS ──────────────────────────────
+@bot.tree.command(name="setupstats", description="Create auto-updating server stat channels")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_setupstats(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+
+    # Create or find Stats category
+    category = discord.utils.get(guild.categories, name="📊 Server Stats")
+    if not category:
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
+            guild.me: discord.PermissionOverwrite(view_channel=True, manage_channels=True)
+        }
+        category = await guild.create_category("📊 Server Stats", overwrites=overwrites)
+
+    # Create stat channels
+    members_ch   = await guild.create_voice_channel(f"👥 Members: {guild.member_count}", category=category)
+    humans_ch    = await guild.create_voice_channel(f"👤 Humans: {sum(1 for m in guild.members if not m.bot)}", category=category)
+    bots_ch      = await guild.create_voice_channel(f"🤖 Bots: {sum(1 for m in guild.members if m.bot)}", category=category)
+    online_ch    = await guild.create_voice_channel(f"🟢 Online: {sum(1 for m in guild.members if m.status != discord.Status.offline)}", category=category)
+
+    # Save channel IDs to config
+    guild_cfg = config.setdefault(str(guild.id), {})
+    guild_cfg["stats_channels"] = {
+        "members": str(members_ch.id),
+        "humans":  str(humans_ch.id),
+        "bots":    str(bots_ch.id),
+        "online":  str(online_ch.id),
+    }
+    save_config(config)
+
+    await interaction.followup.send("✅ Server stats channels created! They update every 10 minutes.", ephemeral=True)
+
+@bot.tree.command(name="removestats", description="Remove the server stats channels")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_removestats(interaction: discord.Interaction):
+    guild_cfg = config.get(str(interaction.guild.id), {})
+    channels = guild_cfg.get("stats_channels", {})
+    for ch_id in channels.values():
+        ch = interaction.guild.get_channel(int(ch_id))
+        if ch:
+            await ch.delete()
+    guild_cfg.pop("stats_channels", None)
+    save_config(config)
+    await interaction.response.send_message("✅ Stats channels removed.")
+
+
+# ── VOICE XP SETTINGS ─────────────────────────
+@bot.tree.command(name="setvoicexplog", description="Set a channel to log voice XP gains")
+@app_commands.describe(channel="Log channel")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_setvoicexplog(interaction: discord.Interaction, channel: discord.TextChannel):
+    guild_cfg = config.setdefault(str(interaction.guild.id), {})
+    guild_cfg["voice_xp_log"] = str(channel.id)
+    save_config(config)
+    await interaction.response.send_message(f"✅ Voice XP logs will appear in {channel.mention}.")
+
+@bot.tree.command(name="voicexp", description="Check how much XP you earned from voice today")
+async def slash_voicexp(interaction: discord.Interaction):
+    uid = interaction.user.id
+    if uid in voice_track:
+        now = datetime.datetime.utcnow()
+        minutes = (now - voice_track[uid]).total_seconds() / 60
+        potential = max(1, int(minutes * 1))
+        embed = discord.Embed(title="🎙️ Voice XP", color=discord.Color.purple())
+        embed.add_field(name="Currently in voice", value=f"**{int(minutes)} minutes**", inline=True)
+        embed.add_field(name="XP on leaving", value=f"**+{potential} XP**", inline=True)
+        embed.set_footer(text="XP is awarded when you leave the voice channel")
+        await interaction.response.send_message(embed=embed)
+    else:
+        data = get_xp(interaction.guild.id, uid)
+        embed = discord.Embed(title="🎙️ Voice XP", color=discord.Color.purple())
+        embed.description = "You're not currently in a voice channel."
+        embed.add_field(name="Your Level", value=data["level"], inline=True)
+        embed.add_field(name="Your XP",    value=data["xp"],   inline=True)
+        embed.set_footer(text="Join a voice channel to earn XP over time!")
+        await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="whoinvoice", description="See who is currently in voice channels")
+async def slash_whoinvoice(interaction: discord.Interaction):
+    guild = interaction.guild
+    embed = discord.Embed(title=f"🎙️ Voice Channels — {guild.name}", color=discord.Color.purple())
+    any_found = False
+    for vc in guild.voice_channels:
+        if vc.members:
+            any_found = True
+            now = datetime.datetime.utcnow()
+            member_list = []
+            for m in vc.members:
+                if m.id in voice_track:
+                    mins = int((now - voice_track[m.id]).total_seconds() / 60)
+                    member_list.append(f"{m.display_name} ({mins}m)")
+                else:
+                    member_list.append(m.display_name)
+            embed.add_field(
+                name=f"🔊 {vc.name} ({len(vc.members)})",
+                value="
+".join(member_list),
+                inline=False
+            )
+    if not any_found:
+        embed.description = "Nobody is in any voice channels right now."
+    await interaction.response.send_message(embed=embed)
+
 @bot.tree.command(name="help", description="Show all commands")
 async def slash_help(interaction: discord.Interaction):
     embed = discord.Embed(title="📖 All Commands", color=discord.Color.green(), description="Type `/` to see all commands with descriptions!")
-    embed.add_field(name="🎫 Tickets",     value="`/ticketsetup`", inline=False)
-    embed.add_field(name="🔨 Moderation",  value="`/kick` `/ban` `/unban` `/mute` `/unmute` `/warn` `/warnings` `/clearwarnings` `/purge` `/slowmode` `/lock` `/unlock` `/nick`", inline=False)
-    embed.add_field(name="🏷️ Roles",       value="`/addrole` `/removerole` `/reactionrole`", inline=False)
-    embed.add_field(name="⚙️ Setup",       value="`/setautorole` `/setwelcome` `/setleave` `/setlevelchannel`", inline=False)
-    embed.add_field(name="📊 Leveling",    value="`/level` `/leaderboard`", inline=False)
-    embed.add_field(name="💰 Economy",     value="`/balance` `/daily` `/work` `/gamble` `/givemoney`", inline=False)
-    embed.add_field(name="🎉 Giveaways",   value="`/giveaway`", inline=False)
-    embed.add_field(name="📢 Utility",     value="`/poll` `/announce` `/remind` `/afk` `/snipe` `/embed` `/say`", inline=False)
-    embed.add_field(name="😂 Fun",         value="`/8ball` `/coinflip` `/dice` `/rps` `/joke` `/fact` `/roast` `/compliment` `/howcool` `/ship`", inline=False)
-    embed.add_field(name="ℹ️ Info",        value="`/userinfo` `/serverinfo` `/avatar` `/ping`", inline=False)
+    embed.add_field(name="🎫 Tickets",    value="`/ticketsetup`", inline=False)
+    embed.add_field(name="🔨 Moderation", value="`/kick` `/ban` `/unban` `/mute` `/unmute` `/warn` `/warnings` `/clearwarnings` `/purge` `/slowmode` `/lock` `/unlock` `/nick`", inline=False)
+    embed.add_field(name="🏷️ Roles",      value="`/addrole` `/removerole`", inline=False)
+    embed.add_field(name="⚙️ Setup",      value="`/setautorole` `/setwelcome` `/setleave`", inline=False)
+    embed.add_field(name="🛡️ Auto-Mod",   value="`/automod` `/automodstatus` `/addbadword` `/removebadword` `/setminaccountage` `/setlogchannel`", inline=False)
+    embed.add_field(name="📈 Leveling",   value="`/level` `/leaderboard` `/setlevelchannel` `/resetxp`", inline=False)
+    embed.add_field(name="🎙️ Voice XP",   value="`/voicexp` `/whoinvoice` `/setvoicexplog`", inline=False)
+    embed.add_field(name="🎰 Slots",       value="`/slots` `/coinbalance` `/daily` `/givecoin`", inline=False)
+    embed.add_field(name="📊 Stats",       value="`/setupstats` `/removestats`", inline=False)
+    embed.add_field(name="😂 Fun",        value="`/8ball`", inline=False)
+    embed.add_field(name="ℹ️ Info",       value="`/userinfo` `/serverinfo` `/avatar` `/ping`", inline=False)
     await interaction.response.send_message(embed=embed)
 
 # ══════════════════════════════════════════════
