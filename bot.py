@@ -38,13 +38,24 @@ async def on_ready():
 @bot.event
 async def on_member_join(member):
     guild_cfg = config.get(str(member.guild.id), {})
-    autorole_id = guild_cfg.get("autorole")
+
+    # Check env var first (persists on Railway), then fall back to config file
+    autorole_id = os.getenv("AUTOROLE_ID") or guild_cfg.get("autorole")
     if autorole_id:
         role = member.guild.get_role(int(autorole_id))
         if role:
-            await member.add_roles(role, reason="Auto-role on join")
-    welcome_channel_id = guild_cfg.get("welcome_channel")
-    welcome_message = guild_cfg.get("welcome_message", "Welcome to the server, {mention}!")
+            try:
+                await member.add_roles(role, reason="Auto-role on join")
+                print(f"Gave role {role.name} to {member.display_name}")
+            except discord.Forbidden:
+                print(f"ERROR: Bot does not have permission to assign role {role.name}!")
+            except Exception as e:
+                print(f"ERROR giving autorole: {e}")
+        else:
+            print(f"ERROR: Role ID {autorole_id} not found in server!")
+
+    welcome_channel_id = os.getenv("WELCOME_CHANNEL_ID") or guild_cfg.get("welcome_channel")
+    welcome_message = os.getenv("WELCOME_MESSAGE") or guild_cfg.get("welcome_message", "Welcome to the server, {mention}!")
     if welcome_channel_id:
         channel = member.guild.get_channel(int(welcome_channel_id))
         if channel:
@@ -293,7 +304,15 @@ async def slash_setautorole(interaction: discord.Interaction, role: discord.Role
     guild_cfg = config.setdefault(str(interaction.guild.id), {})
     guild_cfg["autorole"] = str(role.id)
     save_config(config)
-    await interaction.response.send_message(f"Auto-role set to {role.name}.")
+    embed = discord.Embed(title="Auto-Role Set!", color=discord.Color.green())
+    embed.add_field(name="Role", value=role.mention, inline=True)
+    embed.add_field(name="Role ID", value=str(role.id), inline=True)
+    embed.add_field(
+        name="Important - Make it permanent!",
+        value=f"To make this survive bot restarts, add this to Railway Variables:\n`AUTOROLE_ID` = `{role.id}`",
+        inline=False
+    )
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="setwelcome", description="Set welcome channel and message")
 @app_commands.describe(channel="Welcome channel", message="Message (use {mention} {name} {server})")
