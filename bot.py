@@ -24,6 +24,34 @@ def save_config(data):
 
 config = load_config()
 
+# ─────────────────────────────────────────────
+#  ENV-FIRST SETTINGS HELPERS
+#  These read from Railway env vars first,
+#  then fall back to config.json
+# ─────────────────────────────────────────────
+
+def get_setting(guild_id, key, env_var=None):
+    """Read a setting — env var wins over config.json"""
+    if env_var:
+        val = os.getenv(env_var)
+        if val:
+            return val
+    return config.get(str(guild_id), {}).get(key)
+
+def set_setting(guild_id, key, value):
+    """Save a setting to config.json"""
+    guild_cfg = config.setdefault(str(guild_id), {})
+    guild_cfg[key] = value
+    save_config(config)
+
+def railway_hint(env_var, value):
+    """Returns a tip telling the user how to persist the setting on Railway"""
+    return (
+        f"\n\n⚠️ **To make this survive bot restarts, add this to Railway:**\n"
+        f"Variable name: `{env_var}`\n"
+        f"Value: `{value}`"
+    )
+
 intents = discord.Intents.default()
 intents.members         = True
 intents.message_content = True
@@ -140,8 +168,7 @@ async def on_member_join(member):
 
 @bot.event
 async def on_member_remove(member):
-    guild_cfg = config.get(str(member.guild.id), {})
-    leave_channel_id = guild_cfg.get("leave_channel")
+    leave_channel_id = get_setting(member.guild.id, "leave_channel", "LEAVE_CHANNEL_ID")
     if leave_channel_id:
         channel = member.guild.get_channel(int(leave_channel_id))
         if channel:
@@ -154,7 +181,7 @@ async def on_reaction_add(reaction, user):
     if user.bot:
         return
     guild_cfg = config.get(str(reaction.message.guild.id), {})
-    rr = guild_cfg.get("reaction_roles", {})
+    rr = guild_cfg.get("reaction_roles", {})  # reaction roles always stored in config
     msg_id = str(reaction.message.id)
     if msg_id in rr:
         emoji_str = str(reaction.emoji)
@@ -168,7 +195,7 @@ async def on_reaction_remove(reaction, user):
     if user.bot:
         return
     guild_cfg = config.get(str(reaction.message.guild.id), {})
-    rr = guild_cfg.get("reaction_roles", {})
+    rr = guild_cfg.get("reaction_roles", {})  # reaction roles always stored in config
     msg_id = str(reaction.message.id)
     if msg_id in rr:
         emoji_str = str(reaction.emoji)
@@ -522,33 +549,48 @@ async def slash_removerole(interaction: discord.Interaction, member: discord.Mem
 @app_commands.describe(role="Role to auto-give")
 @app_commands.checks.has_permissions(administrator=True)
 async def slash_setautorole(interaction: discord.Interaction, role: discord.Role):
-    guild_cfg = config.setdefault(str(interaction.guild.id), {})
-    guild_cfg["autorole"] = str(role.id)
-    save_config(config)
+    set_setting(interaction.guild.id, "autorole", str(role.id))
     embed = discord.Embed(title="✅ Auto-Role Set!", color=discord.Color.green())
     embed.add_field(name="Role", value=role.mention, inline=True)
-    embed.add_field(name="Make it permanent on Railway", value=f"Add variable: `AUTOROLE_ID` = `{role.id}`", inline=False)
+    embed.add_field(
+        name="⚠️ Make it survive restarts!",
+        value=f"Go to Railway → Variables and add:\n`AUTOROLE_ID` = `{role.id}`",
+        inline=False
+    )
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="setwelcome", description="Set welcome channel and message")
 @app_commands.describe(channel="Channel", message="Message ({mention} {name} {server})")
 @app_commands.checks.has_permissions(administrator=True)
 async def slash_setwelcome(interaction: discord.Interaction, channel: discord.TextChannel, message: str = None):
-    guild_cfg = config.setdefault(str(interaction.guild.id), {})
-    guild_cfg["welcome_channel"] = str(channel.id)
+    set_setting(interaction.guild.id, "welcome_channel", str(channel.id))
+    default_msg = "Welcome to the server, {mention}! 🎉"
     if message:
-        guild_cfg["welcome_message"] = message
-    save_config(config)
-    await interaction.response.send_message(f"✅ Welcome channel set to {channel.mention}.")
+        set_setting(interaction.guild.id, "welcome_message", message)
+    final_msg = message or default_msg
+    embed = discord.Embed(title="✅ Welcome Channel Set!", color=discord.Color.green())
+    embed.add_field(name="Channel", value=channel.mention, inline=True)
+    embed.add_field(name="Message", value=final_msg, inline=False)
+    embed.add_field(
+        name="⚠️ Make it survive restarts!",
+        value=f"Go to Railway → Variables and add:\n`WELCOME_CHANNEL_ID` = `{channel.id}`\n`WELCOME_MESSAGE` = `{final_msg}`",
+        inline=False
+    )
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="setleave", description="Set leave channel")
 @app_commands.describe(channel="Channel")
 @app_commands.checks.has_permissions(administrator=True)
 async def slash_setleave(interaction: discord.Interaction, channel: discord.TextChannel):
-    guild_cfg = config.setdefault(str(interaction.guild.id), {})
-    guild_cfg["leave_channel"] = str(channel.id)
-    save_config(config)
-    await interaction.response.send_message(f"✅ Leave channel set to {channel.mention}.")
+    set_setting(interaction.guild.id, "leave_channel", str(channel.id))
+    embed = discord.Embed(title="✅ Leave Channel Set!", color=discord.Color.green())
+    embed.add_field(name="Channel", value=channel.mention, inline=True)
+    embed.add_field(
+        name="⚠️ Make it survive restarts!",
+        value=f"Go to Railway → Variables and add:\n`LEAVE_CHANNEL_ID` = `{channel.id}`",
+        inline=False
+    )
+    await interaction.response.send_message(embed=embed)
 
 # ── INFO ──────────────────────────────────────
 @bot.tree.command(name="ping", description="Check bot latency")
