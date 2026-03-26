@@ -24,14 +24,7 @@ def save_config(data):
 
 config = load_config()
 
-# ─────────────────────────────────────────────
-#  ENV-FIRST SETTINGS HELPERS
-#  These read from Railway env vars first,
-#  then fall back to config.json
-# ─────────────────────────────────────────────
-
 def get_setting(guild_id, key, env_var=None):
-    """Read a setting — env var wins over config.json"""
     if env_var:
         val = os.getenv(env_var)
         if val:
@@ -39,18 +32,47 @@ def get_setting(guild_id, key, env_var=None):
     return config.get(str(guild_id), {}).get(key)
 
 def set_setting(guild_id, key, value):
-    """Save a setting to config.json"""
     guild_cfg = config.setdefault(str(guild_id), {})
     guild_cfg[key] = value
     save_config(config)
 
 def railway_hint(env_var, value):
-    """Returns a tip telling the user how to persist the setting on Railway"""
     return (
         f"\n\n⚠️ **To make this survive bot restarts, add this to Railway:**\n"
         f"Variable name: `{env_var}`\n"
         f"Value: `{value}`"
     )
+
+# ─────────────────────────────────────────────
+#  NATIVE KEY SYSTEM
+# ─────────────────────────────────────────────
+NATIVE_SECRET   = 0xA3F7_C291_5E6B_D840
+NATIVE_OWNER_ID = 1096099089076203530  # ← Replace with your Discord user ID (right click your name → Copy User ID)
+
+def fnv64(data: bytes) -> int:
+    h     = 0xcbf29ce484222325
+    prime = 0x00000001000000b3
+    mask  = 0xFFFFFFFFFFFFFFFF
+    for b in data:
+        h ^= b
+        h  = (h * prime) & mask
+    return h
+
+def u64_to_bytes_le(n: int) -> bytes:
+    return (n & 0xFFFFFFFFFFFFFFFF).to_bytes(8, 'little')
+
+def derive_key(hw_id: int) -> str:
+    mask = 0xFFFFFFFFFFFFFFFF
+    a = fnv64(u64_to_bytes_le((hw_id ^ NATIVE_SECRET) & mask))
+    b = fnv64(u64_to_bytes_le((hw_id ^ NATIVE_SECRET ^ 0x1234567890abcdef) & mask))
+    c = fnv64(u64_to_bytes_le((hw_id ^ NATIVE_SECRET ^ 0xfedcba9876543210) & mask))
+    return (
+        f"NTVE-{(a>>48)&0xFFFF:04X}-{(a>>32)&0xFFFF:04X}"
+        f"-{(b>>48)&0xFFFF:04X}-{(b>>32)&0xFFFF:04X}"
+        f"-{(c>>48)&0xFFFF:04X}"
+    )
+
+# ─────────────────────────────────────────────
 
 intents = discord.Intents.default()
 intents.members         = True
@@ -60,20 +82,19 @@ intents.voice_states    = True
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
-# In-memory stores
-warnings    = {}   # user_id -> [reasons]
-xp_data     = {}   # guild_id -> user_id -> {xp, level}
-spam_track  = {}   # user_id -> [timestamps]
-recent_join = []   # list of join timestamps for anti-raid
-voice_track = {}   # user_id -> join datetime
+warnings    = {}
+xp_data     = {}
+spam_track  = {}
+recent_join = []
+voice_track = {}
+snipe_data  = {}
 
-BAD_WORDS = ["badword1", "badword2", "badword3"]  # ← Add your bad words here
+BAD_WORDS = ["badword1", "badword2", "badword3"]
 
 def get_xp(guild_id, user_id):
     return xp_data.setdefault(str(guild_id), {}).setdefault(str(user_id), {"xp": 0, "level": 1})
 
 def xp_for_level(level):
-    # Starts easy, gets exponentially harder
     return int(100 * (1.4 ** (level - 1)))
 
 # ══════════════════════════════════════════════
@@ -87,19 +108,19 @@ async def on_ready():
     update_stats.start()
     await bot.tree.sync()
     print(f"Logged in as {bot.user} — All systems online!")
+
 @tasks.loop(minutes=10)
 async def update_stats():
     for guild in bot.guilds:
         guild_cfg = config.get(str(guild.id), {})
-        channels = guild_cfg.get("stats_channels", {})
+        channels  = guild_cfg.get("stats_channels", {})
         if not channels:
             continue
         try:
-            total   = guild.member_count
-            humans  = sum(1 for m in guild.members if not m.bot)
-            bots    = sum(1 for m in guild.members if m.bot)
-            online  = sum(1 for m in guild.members if m.status != discord.Status.offline)
-
+            total  = guild.member_count
+            humans = sum(1 for m in guild.members if not m.bot)
+            bots   = sum(1 for m in guild.members if m.bot)
+            online = sum(1 for m in guild.members if m.status != discord.Status.offline)
             if channels.get("members"):
                 ch = guild.get_channel(int(channels["members"]))
                 if ch: await ch.edit(name=f"👥 Members: {total}")
@@ -115,11 +136,8 @@ async def update_stats():
         except Exception as e:
             print(f"Stats update error: {e}")
 
-
-
 @bot.event
 async def on_member_join(member):
-    # ── Anti-Raid ────────────────────────────
     guild_cfg_r = config.get(str(member.guild.id), {})
     if guild_cfg_r.get("automod_antiraid", False):
         now = datetime.datetime.utcnow()
@@ -136,9 +154,8 @@ async def on_member_join(member):
                 return
             except:
                 pass
-    # ── Account age check (anti-raid) ──
     if guild_cfg_r.get("automod_antiraid", False):
-        age = (datetime.datetime.utcnow() - member.created_at.replace(tzinfo=None)).days
+        age     = (datetime.datetime.utcnow() - member.created_at.replace(tzinfo=None)).days
         min_age = guild_cfg_r.get("min_account_age", 7)
         if age < min_age:
             try:
@@ -146,10 +163,8 @@ async def on_member_join(member):
                 return
             except:
                 pass
-
-    guild_cfg = config.get(str(member.guild.id), {})
-
-    autorole_id = os.getenv("AUTOROLE_ID") or guild_cfg.get("autorole")
+    guild_cfg    = config.get(str(member.guild.id), {})
+    autorole_id  = os.getenv("AUTOROLE_ID") or guild_cfg.get("autorole")
     if autorole_id:
         role = member.guild.get_role(int(autorole_id))
         if role:
@@ -157,9 +172,8 @@ async def on_member_join(member):
                 await member.add_roles(role, reason="Auto-role on join")
             except Exception as e:
                 print(f"Autorole error: {e}")
-
     welcome_channel_id = os.getenv("WELCOME_CHANNEL_ID") or guild_cfg.get("welcome_channel")
-    welcome_message = os.getenv("WELCOME_MESSAGE") or guild_cfg.get("welcome_message", "Welcome {mention}!")
+    welcome_message    = os.getenv("WELCOME_MESSAGE")    or guild_cfg.get("welcome_message", "Welcome {mention}!")
     if welcome_channel_id:
         channel = member.guild.get_channel(int(welcome_channel_id))
         if channel:
@@ -174,15 +188,24 @@ async def on_member_remove(member):
         if channel:
             await channel.send(f"👋 **{member.display_name}** has left the server.")
 
-
+@bot.event
+async def on_message_delete(message):
+    if message.author.bot:
+        return
+    snipe_data[message.channel.id] = {
+        "content": message.content or "[no text]",
+        "author":  str(message.author),
+        "avatar":  str(message.author.display_avatar.url),
+        "time":    datetime.datetime.utcnow(),
+    }
 
 @bot.event
 async def on_reaction_add(reaction, user):
     if user.bot:
         return
     guild_cfg = config.get(str(reaction.message.guild.id), {})
-    rr = guild_cfg.get("reaction_roles", {})  # reaction roles always stored in config
-    msg_id = str(reaction.message.id)
+    rr        = guild_cfg.get("reaction_roles", {})
+    msg_id    = str(reaction.message.id)
     if msg_id in rr:
         emoji_str = str(reaction.emoji)
         if emoji_str in rr[msg_id]:
@@ -195,8 +218,8 @@ async def on_reaction_remove(reaction, user):
     if user.bot:
         return
     guild_cfg = config.get(str(reaction.message.guild.id), {})
-    rr = guild_cfg.get("reaction_roles", {})  # reaction roles always stored in config
-    msg_id = str(reaction.message.id)
+    rr        = guild_cfg.get("reaction_roles", {})
+    msg_id    = str(reaction.message.id)
     if msg_id in rr:
         emoji_str = str(reaction.emoji)
         if emoji_str in rr[msg_id]:
@@ -204,36 +227,26 @@ async def on_reaction_remove(reaction, user):
             if role:
                 await user.remove_roles(role)
 
-
-# ══════════════════════════════════════════════
-#  AUTO-MOD + XP ON MESSAGE
-# ══════════════════════════════════════════════
-
 @bot.event
 async def on_message(message):
     if message.author.bot or not message.guild:
         await bot.process_commands(message)
         return
-
     guild_cfg = config.get(str(message.guild.id), {})
-    member = message.author
-
-    # ── Bad Word Filter ──────────────────────
+    member    = message.author
     if guild_cfg.get("automod_badwords", False):
         content_lower = message.content.lower()
-        custom_words = guild_cfg.get("bad_words", [])
-        all_bad = BAD_WORDS + custom_words
+        custom_words  = guild_cfg.get("bad_words", [])
+        all_bad       = BAD_WORDS + custom_words
         if any(word in content_lower for word in all_bad):
             try:
                 await message.delete()
-                warn_msg = await message.channel.send(f"🚫 {member.mention} Watch your language!", delete_after=5)
+                await message.channel.send(f"🚫 {member.mention} Watch your language!", delete_after=5)
                 warnings.setdefault(member.id, []).append("Auto-mod: Bad word")
             except:
                 pass
             await bot.process_commands(message)
             return
-
-    # ── Anti-Link ────────────────────────────
     if guild_cfg.get("automod_antilink", False):
         url_pattern = re.compile(r"(https?://|discord\.gg/|www\.)\S+")
         if url_pattern.search(message.content):
@@ -245,8 +258,6 @@ async def on_message(message):
                     pass
                 await bot.process_commands(message)
                 return
-
-    # ── Anti-Spam ────────────────────────────
     if guild_cfg.get("automod_antispam", False):
         now = datetime.datetime.utcnow()
         uid = member.id
@@ -262,9 +273,7 @@ async def on_message(message):
                 pass
             await bot.process_commands(message)
             return
-
-    # ── XP Gain (1 XP per message, random bonus) ──
-    data = get_xp(message.guild.id, member.id)
+    data   = get_xp(message.guild.id, member.id)
     gained = random.randint(1, 3)
     data["xp"] += gained
     needed = xp_for_level(data["level"])
@@ -272,53 +281,31 @@ async def on_message(message):
         data["xp"] -= needed
         data["level"] += 1
         lvl_channel_id = guild_cfg.get("level_channel")
-        lvl_channel = message.guild.get_channel(int(lvl_channel_id)) if lvl_channel_id else message.channel
+        lvl_channel    = message.guild.get_channel(int(lvl_channel_id)) if lvl_channel_id else message.channel
         try:
             await lvl_channel.send(f"🎉 {member.mention} leveled up to **Level {data['level']}**! Next level needs **{xp_for_level(data['level'])} XP**.")
         except:
             pass
-
     await bot.process_commands(message)
-
-
-@bot.event
-async def on_member_join_antiraid(member):
-    pass  # handled inside on_member_join already
-
-
-
-# ══════════════════════════════════════════════
-#  VOICE XP
-# ══════════════════════════════════════════════
 
 @bot.event
 async def on_voice_state_update(member, before, after):
     if member.bot:
         return
-
     uid = member.id
     now = datetime.datetime.utcnow()
-
-    # User joined a voice channel
     if before.channel is None and after.channel is not None:
         voice_track[uid] = now
-
-    # User left a voice channel
     elif before.channel is not None and after.channel is None:
         if uid in voice_track:
             joined_at = voice_track.pop(uid)
-            minutes = (now - joined_at).total_seconds() / 60
-
-            # 1 XP per minute in voice, min 1 minute to count
+            minutes   = (now - joined_at).total_seconds() / 60
             if minutes >= 1 and member.guild:
                 earned = max(1, int(minutes * 1))
-                data = get_xp(member.guild.id, member.id)
+                data   = get_xp(member.guild.id, member.id)
                 data["xp"] += earned
-                needed = xp_for_level(data["level"])
-
-                guild_cfg = config.get(str(member.guild.id), {})
-
-                # Check level up
+                needed     = xp_for_level(data["level"])
+                guild_cfg  = config.get(str(member.guild.id), {})
                 if data["xp"] >= needed:
                     data["xp"] -= needed
                     data["level"] += 1
@@ -330,16 +317,12 @@ async def on_voice_state_update(member, before, after):
                                 await lvl_channel.send(f"🎉 {member.mention} leveled up to **Level {data['level']}** (from voice chat)!")
                             except:
                                 pass
-
-                # Log to voice XP log channel if set
                 log_ch_id = guild_cfg.get("voice_xp_log")
                 if log_ch_id:
                     log_ch = member.guild.get_channel(int(log_ch_id))
                     if log_ch:
                         try:
-                            await log_ch.send(
-                                f"🎙️ **{member.display_name}** spent **{int(minutes)}m** in voice and earned **+{earned} XP** (Level {data['level']})"
-                            )
+                            await log_ch.send(f"🎙️ **{member.display_name}** spent **{int(minutes)}m** in voice and earned **+{earned} XP** (Level {data['level']})")
                         except:
                             pass
 
@@ -353,8 +336,8 @@ class CloseTicketButton(discord.ui.View):
 
     @discord.ui.button(label="🔒 Close Ticket", style=discord.ButtonStyle.danger, custom_id="close_ticket")
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        channel = interaction.channel
-        is_admin = interaction.user.guild_permissions.administrator
+        channel    = interaction.channel
+        is_admin   = interaction.user.guild_permissions.administrator
         is_creator = str(interaction.user.id) in (channel.topic or "")
         if not is_admin and not is_creator:
             return await interaction.response.send_message("Only the ticket creator or an admin can close this.", ephemeral=True)
@@ -368,16 +351,14 @@ class TicketButton(discord.ui.View):
 
     @discord.ui.button(label="🎫 Create Ticket", style=discord.ButtonStyle.primary, custom_id="create_ticket")
     async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild = interaction.guild
-        guild_cfg = config.setdefault(str(guild.id), {})
+        guild      = interaction.guild
+        guild_cfg  = config.setdefault(str(guild.id), {})
         ticket_count = guild_cfg.get("ticket_count", 0) + 1
         guild_cfg["ticket_count"] = ticket_count
         save_config(config)
-
         existing = discord.utils.get(guild.text_channels, topic=f"ticket-owner-{interaction.user.id}")
         if existing:
             return await interaction.response.send_message(f"You already have an open ticket: {existing.mention}", ephemeral=True)
-
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
             interaction.user:   discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
@@ -386,17 +367,11 @@ class TicketButton(discord.ui.View):
         for role in guild.roles:
             if role.permissions.administrator:
                 overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-
         category = discord.utils.get(guild.categories, name="Tickets")
         if not category:
-            category = await guild.create_category("Tickets", overwrites={
-                guild.default_role: discord.PermissionOverwrite(view_channel=False)
-            })
-
+            category = await guild.create_category("Tickets", overwrites={guild.default_role: discord.PermissionOverwrite(view_channel=False)})
         channel = await guild.create_text_channel(
-            name=f"ticket-{ticket_count:04d}",
-            category=category,
-            overwrites=overwrites,
+            name=f"ticket-{ticket_count:04d}", category=category, overwrites=overwrites,
             topic=f"ticket-owner-{interaction.user.id}"
         )
         embed = discord.Embed(title=f"🎫 Ticket #{ticket_count:04d}", description=f"Welcome {interaction.user.mention}!\n\nDescribe your issue and staff will assist shortly.\n\nClick below to close the ticket.", color=discord.Color.green())
@@ -407,6 +382,26 @@ class TicketButton(discord.ui.View):
 # ══════════════════════════════════════════════
 #  SLASH COMMANDS
 # ══════════════════════════════════════════════
+
+# ── NATIVE KEY GENERATOR ──────────────────────
+@bot.tree.command(name="key", description="Generate a NATIVE license key for a Machine ID")
+@app_commands.describe(machine_id="The user's 16-character Machine ID (e.g. A3F7C2915E6BD840)")
+async def slash_key(interaction: discord.Interaction, machine_id: str):
+    if interaction.user.id != NATIVE_OWNER_ID:
+        return await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+    cleaned = machine_id.strip().upper().replace("-", "").replace(" ", "")
+    if len(cleaned) != 16 or not all(c in "0123456789ABCDEF" for c in cleaned):
+        return await interaction.response.send_message(
+            f"❌ Invalid Machine ID — must be exactly 16 hex characters.\nYou entered: `{machine_id}` ({len(cleaned)} valid chars)",
+            ephemeral=True
+        )
+    hw_id = int(cleaned, 16)
+    key   = derive_key(hw_id)
+    embed = discord.Embed(title="🔑 NATIVE License Key", color=discord.Color.from_rgb(0, 185, 255))
+    embed.add_field(name="Machine ID",  value=f"`{cleaned}`",    inline=False)
+    embed.add_field(name="License Key", value=f"```{key}```",    inline=False)
+    embed.set_footer(text="This key only works on the machine with that ID.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ── TICKET SETUP ──────────────────────────────
 @bot.tree.command(name="ticketsetup", description="Set up the ticket panel")
@@ -494,7 +489,7 @@ async def slash_clearwarnings(interaction: discord.Interaction, member: discord.
 @app_commands.describe(amount="Amount (max 100)")
 @app_commands.checks.has_permissions(manage_messages=True)
 async def slash_purge(interaction: discord.Interaction, amount: int):
-    amount = min(amount, 100)
+    amount  = min(amount, 100)
     await interaction.response.defer(ephemeral=True)
     deleted = await interaction.channel.purge(limit=amount)
     await interaction.followup.send(f"🗑️ Deleted {len(deleted)} messages.", ephemeral=True)
@@ -552,11 +547,7 @@ async def slash_setautorole(interaction: discord.Interaction, role: discord.Role
     set_setting(interaction.guild.id, "autorole", str(role.id))
     embed = discord.Embed(title="✅ Auto-Role Set!", color=discord.Color.green())
     embed.add_field(name="Role", value=role.mention, inline=True)
-    embed.add_field(
-        name="⚠️ Make it survive restarts!",
-        value=f"Go to Railway → Variables and add:\n`AUTOROLE_ID` = `{role.id}`",
-        inline=False
-    )
+    embed.add_field(name="⚠️ Make it survive restarts!", value=f"Go to Railway → Variables and add:\n`AUTOROLE_ID` = `{role.id}`", inline=False)
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="setwelcome", description="Set welcome channel and message")
@@ -571,11 +562,7 @@ async def slash_setwelcome(interaction: discord.Interaction, channel: discord.Te
     embed = discord.Embed(title="✅ Welcome Channel Set!", color=discord.Color.green())
     embed.add_field(name="Channel", value=channel.mention, inline=True)
     embed.add_field(name="Message", value=final_msg, inline=False)
-    embed.add_field(
-        name="⚠️ Make it survive restarts!",
-        value=f"Go to Railway → Variables and add:\n`WELCOME_CHANNEL_ID` = `{channel.id}`\n`WELCOME_MESSAGE` = `{final_msg}`",
-        inline=False
-    )
+    embed.add_field(name="⚠️ Make it survive restarts!", value=f"Go to Railway → Variables and add:\n`WELCOME_CHANNEL_ID` = `{channel.id}`\n`WELCOME_MESSAGE` = `{final_msg}`", inline=False)
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="setleave", description="Set leave channel")
@@ -585,11 +572,7 @@ async def slash_setleave(interaction: discord.Interaction, channel: discord.Text
     set_setting(interaction.guild.id, "leave_channel", str(channel.id))
     embed = discord.Embed(title="✅ Leave Channel Set!", color=discord.Color.green())
     embed.add_field(name="Channel", value=channel.mention, inline=True)
-    embed.add_field(
-        name="⚠️ Make it survive restarts!",
-        value=f"Go to Railway → Variables and add:\n`LEAVE_CHANNEL_ID` = `{channel.id}`",
-        inline=False
-    )
+    embed.add_field(name="⚠️ Make it survive restarts!", value=f"Go to Railway → Variables and add:\n`LEAVE_CHANNEL_ID` = `{channel.id}`", inline=False)
     await interaction.response.send_message(embed=embed)
 
 # ── INFO ──────────────────────────────────────
@@ -601,8 +584,8 @@ async def slash_ping(interaction: discord.Interaction):
 @app_commands.describe(member="Member")
 async def slash_userinfo(interaction: discord.Interaction, member: discord.Member = None):
     member = member or interaction.user
-    roles = [r.mention for r in member.roles if r.name != "@everyone"]
-    embed = discord.Embed(title=f"User Info — {member}", color=member.color)
+    roles  = [r.mention for r in member.roles if r.name != "@everyone"]
+    embed  = discord.Embed(title=f"User Info — {member}", color=member.color)
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.add_field(name="ID",      value=member.id,                              inline=True)
     embed.add_field(name="Joined",  value=member.joined_at.strftime("%Y-%m-%d"),  inline=True)
@@ -616,10 +599,10 @@ async def slash_serverinfo(interaction: discord.Interaction):
     embed = discord.Embed(title=g.name, color=discord.Color.blurple())
     if g.icon:
         embed.set_thumbnail(url=g.icon.url)
-    embed.add_field(name="Owner",    value=g.owner.mention,  inline=True)
-    embed.add_field(name="Members",  value=g.member_count,   inline=True)
-    embed.add_field(name="Channels", value=len(g.channels),  inline=True)
-    embed.add_field(name="Roles",    value=len(g.roles),     inline=True)
+    embed.add_field(name="Owner",    value=g.owner.mention, inline=True)
+    embed.add_field(name="Members",  value=g.member_count,  inline=True)
+    embed.add_field(name="Channels", value=len(g.channels), inline=True)
+    embed.add_field(name="Roles",    value=len(g.roles),    inline=True)
     embed.add_field(name="Created",  value=g.created_at.strftime("%Y-%m-%d"), inline=True)
     await interaction.response.send_message(embed=embed)
 
@@ -627,7 +610,7 @@ async def slash_serverinfo(interaction: discord.Interaction):
 @app_commands.describe(member="Member")
 async def slash_avatar(interaction: discord.Interaction, member: discord.Member = None):
     member = member or interaction.user
-    embed = discord.Embed(title=f"{member.display_name}'s Avatar", color=discord.Color.blurple())
+    embed  = discord.Embed(title=f"{member.display_name}'s Avatar", color=discord.Color.blurple())
     embed.set_image(url=member.display_avatar.url)
     await interaction.response.send_message(embed=embed)
 
@@ -646,26 +629,21 @@ async def slash_snipe(interaction: discord.Interaction):
 @app_commands.describe(question="Your question")
 async def slash_8ball(interaction: discord.Interaction, question: str):
     responses = [
-        "It is certain.", "It is decidedly so.", "Without a doubt.",
-        "Yes definitely.", "You may rely on it.", "As I see it, yes.",
-        "Most likely.", "Outlook good.", "Yes.", "Signs point to yes.",
-        "Reply hazy, try again.", "Ask again later.", "Better not tell you now.",
-        "Cannot predict now.", "Concentrate and ask again.",
+        "It is certain.", "It is decidedly so.", "Without a doubt.", "Yes definitely.",
+        "You may rely on it.", "As I see it, yes.", "Most likely.", "Outlook good.",
+        "Yes.", "Signs point to yes.", "Reply hazy, try again.", "Ask again later.",
+        "Better not tell you now.", "Cannot predict now.", "Concentrate and ask again.",
         "Don't count on it.", "My reply is no.", "My sources say no.",
         "Outlook not so good.", "Very doubtful."
     ]
     embed = discord.Embed(title="🎱 Magic 8-Ball", color=discord.Color.dark_purple())
-    embed.add_field(name="Question", value=question, inline=False)
-    embed.add_field(name="Answer",   value=random.choice(responses), inline=False)
+    embed.add_field(name="Question", value=question,                   inline=False)
+    embed.add_field(name="Answer",   value=random.choice(responses),   inline=False)
     await interaction.response.send_message(embed=embed)
 
-
-# ── AUTO-MOD SETUP ────────────────────────────
+# ── AUTO-MOD ──────────────────────────────────
 @bot.tree.command(name="automod", description="Toggle auto-mod features on or off")
-@app_commands.describe(
-    feature="Which feature to toggle",
-    enabled="Turn on or off"
-)
+@app_commands.describe(feature="Which feature to toggle", enabled="Turn on or off")
 @app_commands.choices(feature=[
     app_commands.Choice(name="Bad Word Filter", value="automod_badwords"),
     app_commands.Choice(name="Anti-Link",       value="automod_antilink"),
@@ -678,7 +656,7 @@ async def slash_automod(interaction: discord.Interaction, feature: str, enabled:
     guild_cfg[feature] = enabled
     save_config(config)
     status = "✅ Enabled" if enabled else "❌ Disabled"
-    names = {"automod_badwords": "Bad Word Filter", "automod_antilink": "Anti-Link", "automod_antispam": "Anti-Spam", "automod_antiraid": "Anti-Raid"}
+    names  = {"automod_badwords": "Bad Word Filter", "automod_antilink": "Anti-Link", "automod_antispam": "Anti-Spam", "automod_antiraid": "Anti-Raid"}
     await interaction.response.send_message(f"{status} **{names[feature]}**!")
 
 @bot.tree.command(name="addbadword", description="Add a word to the bad word filter")
@@ -742,16 +720,16 @@ async def slash_setlogchannel(interaction: discord.Interaction, channel: discord
 @bot.tree.command(name="level", description="Check your or someone's level and XP")
 @app_commands.describe(member="Member to check")
 async def slash_level(interaction: discord.Interaction, member: discord.Member = None):
-    member = member or interaction.user
-    data = get_xp(interaction.guild.id, member.id)
-    needed = xp_for_level(data["level"])
+    member     = member or interaction.user
+    data       = get_xp(interaction.guild.id, member.id)
+    needed     = xp_for_level(data["level"])
     bar_filled = int((data["xp"] / needed) * 10)
-    bar = "█" * bar_filled + "░" * (10 - bar_filled)
+    bar        = "█" * bar_filled + "░" * (10 - bar_filled)
     embed = discord.Embed(title=f"📈 Level — {member.display_name}", color=discord.Color.gold())
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="Level",    value=f"**{data['level']}**",          inline=True)
-    embed.add_field(name="XP",       value=f"{data['xp']} / {needed}",      inline=True)
-    embed.add_field(name="Progress", value=f"`{bar}`",                      inline=False)
+    embed.add_field(name="Level",    value=f"**{data['level']}**",         inline=True)
+    embed.add_field(name="XP",       value=f"{data['xp']} / {needed}",     inline=True)
+    embed.add_field(name="Progress", value=f"`{bar}`",                     inline=False)
     embed.add_field(name="Next level needs", value=f"{needed - data['xp']} more XP", inline=False)
     await interaction.response.send_message(embed=embed)
 
@@ -761,12 +739,12 @@ async def slash_leaderboard(interaction: discord.Interaction):
     if not guild_xp:
         return await interaction.response.send_message("❌ No XP data yet!")
     sorted_users = sorted(guild_xp.items(), key=lambda x: (x[1]["level"], x[1]["xp"]), reverse=True)[:10]
-    embed = discord.Embed(title=f"🏆 XP Leaderboard — {interaction.guild.name}", color=discord.Color.gold())
+    embed  = discord.Embed(title=f"🏆 XP Leaderboard — {interaction.guild.name}", color=discord.Color.gold())
     medals = ["🥇", "🥈", "🥉"]
     for i, (uid, d) in enumerate(sorted_users):
         medal = medals[i] if i < 3 else f"**{i+1}.**"
-        m = interaction.guild.get_member(int(uid))
-        name = m.display_name if m else f"User {uid}"
+        m     = interaction.guild.get_member(int(uid))
+        name  = m.display_name if m else f"User {uid}"
         embed.add_field(name=f"{medal} {name}", value=f"Level {d['level']} • {d['xp']} XP", inline=False)
     await interaction.response.send_message(embed=embed)
 
@@ -786,73 +764,57 @@ async def slash_resetxp(interaction: discord.Interaction, member: discord.Member
     xp_data.get(str(interaction.guild.id), {}).pop(str(member.id), None)
     await interaction.response.send_message(f"✅ Reset XP for **{member.display_name}**.")
 
-
-# ── SLOT MACHINE ──────────────────────────────
-@bot.tree.command(name="slots", description="Play the slot machine! (costs 10 coins to play)")
+# ── SLOTS ─────────────────────────────────────
+@bot.tree.command(name="slots", description="Play the slot machine!")
 @app_commands.describe(bet="How many coins to bet (min 10)")
 async def slash_slots(interaction: discord.Interaction, bet: int = 10):
-    from discord.ext import commands
     if bet < 10:
         return await interaction.response.send_message("❌ Minimum bet is **10 coins**!", ephemeral=True)
-
-    # Simple coin store per user
     coins_store = xp_data.setdefault("coins", {})
     uid = str(interaction.user.id)
-    coins_store.setdefault(uid, 100)  # start with 100 coins
-
+    coins_store.setdefault(uid, 100)
     if coins_store[uid] < bet:
         return await interaction.response.send_message(f"❌ You only have **🪙 {coins_store[uid]} coins**!", ephemeral=True)
-
-    slots = ["🍒", "🍋", "🍊", "🍇", "⭐", "💎", "7️⃣"]
-    weights = [30, 25, 20, 15, 5, 3, 2]  # rarer symbols = lower weight
-
-    import random as _r
-    reel1 = _r.choices(slots, weights=weights)[0]
-    reel2 = _r.choices(slots, weights=weights)[0]
-    reel3 = _r.choices(slots, weights=weights)[0]
-
+    slots   = ["🍒", "🍋", "🍊", "🍇", "⭐", "💎", "7️⃣"]
+    weights = [30, 25, 20, 15, 5, 3, 2]
+    reel1 = random.choices(slots, weights=weights)[0]
+    reel2 = random.choices(slots, weights=weights)[0]
+    reel3 = random.choices(slots, weights=weights)[0]
     display = f"┃ {reel1} ┃ {reel2} ┃ {reel3} ┃"
-
-    multipliers = {
-        "💎": 50, "7️⃣": 25, "⭐": 10,
-        "🍇": 5,  "🍊": 4,  "🍋": 3, "🍒": 2
-    }
-
+    multipliers = {"💎": 50, "7️⃣": 25, "⭐": 10, "🍇": 5, "🍊": 4, "🍋": 3, "🍒": 2}
     coins_store[uid] -= bet
-
     if reel1 == reel2 == reel3:
         mult = multipliers.get(reel1, 2)
         winnings = bet * mult
         coins_store[uid] += winnings
         result = f"🎉 **JACKPOT! {reel1}{reel1}{reel1}** — You won **🪙 {winnings} coins** (x{mult})!"
-        color = discord.Color.gold()
+        color  = discord.Color.gold()
     elif reel1 == reel2 or reel2 == reel3:
         winnings = bet * 2
         coins_store[uid] += winnings
         result = f"✨ **Two of a kind!** — You won **🪙 {winnings} coins** (x2)!"
-        color = discord.Color.green()
-    elif reel1 == "🍒" or reel2 == "🍒" or reel3 == "🍒":
+        color  = discord.Color.green()
+    elif "🍒" in (reel1, reel2, reel3):
         winnings = int(bet * 0.5)
         coins_store[uid] += winnings
         result = f"🍒 **Cherry bonus!** — You got back **🪙 {winnings} coins**."
-        color = discord.Color.orange()
+        color  = discord.Color.orange()
     else:
         result = f"😔 **No match!** — You lost **🪙 {bet} coins**."
-        color = discord.Color.red()
-
+        color  = discord.Color.red()
     embed = discord.Embed(title="🎰 Slot Machine", color=color)
-    embed.add_field(name="Reels", value=f"```{display}```", inline=False)
-    embed.add_field(name="Result", value=result, inline=False)
+    embed.add_field(name="Reels",   value=f"```{display}```", inline=False)
+    embed.add_field(name="Result",  value=result,             inline=False)
     embed.add_field(name="Balance", value=f"🪙 {coins_store[uid]} coins", inline=False)
     embed.set_footer(text="💎=x50 | 7️⃣=x25 | ⭐=x10 | 🍇=x5 | 🍊=x4 | 🍋=x3 | 🍒=x2")
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="coinbalance", description="Check your slot machine coin balance")
+@bot.tree.command(name="coinbalance", description="Check your coin balance")
 async def slash_coinbalance(interaction: discord.Interaction):
     coins_store = xp_data.setdefault("coins", {})
     uid = str(interaction.user.id)
     coins_store.setdefault(uid, 100)
-    await interaction.response.send_message(f"You have **{coins_store[uid]} coins**! Play `/slots` to win more or lose them all!")
+    await interaction.response.send_message(f"You have **{coins_store[uid]} coins**!")
 
 @bot.tree.command(name="givecoin", description="Give coins to another member")
 @app_commands.describe(member="Who to give to", amount="How many coins")
@@ -860,34 +822,34 @@ async def slash_givecoin(interaction: discord.Interaction, member: discord.Membe
     if amount <= 0:
         return await interaction.response.send_message("❌ Amount must be positive!", ephemeral=True)
     coins_store = xp_data.setdefault("coins", {})
-    giver = str(interaction.user.id)
+    giver    = str(interaction.user.id)
     receiver = str(member.id)
     coins_store.setdefault(giver, 100)
     coins_store.setdefault(receiver, 100)
     if coins_store[giver] < amount:
         return await interaction.response.send_message(f"❌ You only have **🪙 {coins_store[giver]}**!", ephemeral=True)
-    coins_store[giver] -= amount
+    coins_store[giver]    -= amount
     coins_store[receiver] += amount
-    await interaction.response.send_message(f"✅ Gave **🪙 {amount} coins** to {member.mention}! They now have {coins_store[receiver]} coins.")
+    await interaction.response.send_message(f"✅ Gave **🪙 {amount} coins** to {member.mention}!")
 
-@bot.tree.command(name="daily", description="Claim your daily coins (resets every 24h)")
+@bot.tree.command(name="daily", description="Claim your daily coins")
 async def slash_daily(interaction: discord.Interaction):
     coins_store = xp_data.setdefault("coins", {})
     daily_store = xp_data.setdefault("daily", {})
-    uid = str(interaction.user.id)
+    uid  = str(interaction.user.id)
     coins_store.setdefault(uid, 100)
-    now = datetime.datetime.utcnow()
+    now  = datetime.datetime.utcnow()
     last = daily_store.get(uid)
     if last:
         last_dt = datetime.datetime.fromisoformat(last)
-        diff = (now - last_dt).total_seconds()
+        diff    = (now - last_dt).total_seconds()
         if diff < 86400:
             h = int((86400 - diff) // 3600)
             m = int(((86400 - diff) % 3600) // 60)
             return await interaction.response.send_message(f"⏰ Come back in **{h}h {m}m** for your daily coins!", ephemeral=True)
     reward = random.randint(50, 200)
     coins_store[uid] += reward
-    daily_store[uid] = now.isoformat()
+    daily_store[uid]  = now.isoformat()
     await interaction.response.send_message(f"✅ You claimed **🪙 {reward} daily coins**! Balance: {coins_store[uid]}")
 
 # ── SERVER STATS ──────────────────────────────
@@ -895,40 +857,28 @@ async def slash_daily(interaction: discord.Interaction):
 @app_commands.checks.has_permissions(administrator=True)
 async def slash_setupstats(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    guild = interaction.guild
-
-    # Create or find Stats category
+    guild    = interaction.guild
     category = discord.utils.get(guild.categories, name="📊 Server Stats")
     if not category:
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
-            guild.me: discord.PermissionOverwrite(view_channel=True, manage_channels=True)
+            guild.me:           discord.PermissionOverwrite(view_channel=True, manage_channels=True)
         }
         category = await guild.create_category("📊 Server Stats", overwrites=overwrites)
-
-    # Create stat channels
-    members_ch   = await guild.create_voice_channel(f"👥 Members: {guild.member_count}", category=category)
-    humans_ch    = await guild.create_voice_channel(f"👤 Humans: {sum(1 for m in guild.members if not m.bot)}", category=category)
-    bots_ch      = await guild.create_voice_channel(f"🤖 Bots: {sum(1 for m in guild.members if m.bot)}", category=category)
-    online_ch    = await guild.create_voice_channel(f"🟢 Online: {sum(1 for m in guild.members if m.status != discord.Status.offline)}", category=category)
-
-    # Save channel IDs to config
-    guild_cfg = config.setdefault(str(guild.id), {})
-    guild_cfg["stats_channels"] = {
-        "members": str(members_ch.id),
-        "humans":  str(humans_ch.id),
-        "bots":    str(bots_ch.id),
-        "online":  str(online_ch.id),
-    }
+    members_ch = await guild.create_voice_channel(f"👥 Members: {guild.member_count}", category=category)
+    humans_ch  = await guild.create_voice_channel(f"👤 Humans: {sum(1 for m in guild.members if not m.bot)}", category=category)
+    bots_ch    = await guild.create_voice_channel(f"🤖 Bots: {sum(1 for m in guild.members if m.bot)}", category=category)
+    online_ch  = await guild.create_voice_channel(f"🟢 Online: {sum(1 for m in guild.members if m.status != discord.Status.offline)}", category=category)
+    guild_cfg  = config.setdefault(str(guild.id), {})
+    guild_cfg["stats_channels"] = {"members": str(members_ch.id), "humans": str(humans_ch.id), "bots": str(bots_ch.id), "online": str(online_ch.id)}
     save_config(config)
-
     await interaction.followup.send("✅ Server stats channels created! They update every 10 minutes.", ephemeral=True)
 
 @bot.tree.command(name="removestats", description="Remove the server stats channels")
 @app_commands.checks.has_permissions(administrator=True)
 async def slash_removestats(interaction: discord.Interaction):
     guild_cfg = config.get(str(interaction.guild.id), {})
-    channels = guild_cfg.get("stats_channels", {})
+    channels  = guild_cfg.get("stats_channels", {})
     for ch_id in channels.values():
         ch = interaction.guild.get_channel(int(ch_id))
         if ch:
@@ -937,8 +887,7 @@ async def slash_removestats(interaction: discord.Interaction):
     save_config(config)
     await interaction.response.send_message("✅ Stats channels removed.")
 
-
-# ── VOICE XP SETTINGS ─────────────────────────
+# ── VOICE XP ──────────────────────────────────
 @bot.tree.command(name="setvoicexplog", description="Set a channel to log voice XP gains")
 @app_commands.describe(channel="Log channel")
 @app_commands.checks.has_permissions(administrator=True)
@@ -948,36 +897,35 @@ async def slash_setvoicexplog(interaction: discord.Interaction, channel: discord
     save_config(config)
     await interaction.response.send_message(f"✅ Voice XP logs will appear in {channel.mention}.")
 
-@bot.tree.command(name="voicexp", description="Check how much XP you earned from voice today")
+@bot.tree.command(name="voicexp", description="Check how much XP you earned from voice")
 async def slash_voicexp(interaction: discord.Interaction):
     uid = interaction.user.id
     if uid in voice_track:
-        now = datetime.datetime.utcnow()
+        now     = datetime.datetime.utcnow()
         minutes = (now - voice_track[uid]).total_seconds() / 60
         potential = max(1, int(minutes * 1))
         embed = discord.Embed(title="🎙️ Voice XP", color=discord.Color.purple())
         embed.add_field(name="Currently in voice", value=f"**{int(minutes)} minutes**", inline=True)
-        embed.add_field(name="XP on leaving", value=f"**+{potential} XP**", inline=True)
+        embed.add_field(name="XP on leaving",      value=f"**+{potential} XP**",        inline=True)
         embed.set_footer(text="XP is awarded when you leave the voice channel")
         await interaction.response.send_message(embed=embed)
     else:
-        data = get_xp(interaction.guild.id, uid)
+        data  = get_xp(interaction.guild.id, uid)
         embed = discord.Embed(title="🎙️ Voice XP", color=discord.Color.purple())
         embed.description = "You're not currently in a voice channel."
         embed.add_field(name="Your Level", value=data["level"], inline=True)
-        embed.add_field(name="Your XP",    value=data["xp"],   inline=True)
-        embed.set_footer(text="Join a voice channel to earn XP over time!")
+        embed.add_field(name="Your XP",    value=data["xp"],    inline=True)
         await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="whoinvoice", description="See who is currently in voice channels")
 async def slash_whoinvoice(interaction: discord.Interaction):
-    guild = interaction.guild
-    embed = discord.Embed(title=f"🎙️ Voice Channels — {guild.name}", color=discord.Color.purple())
+    guild     = interaction.guild
+    embed     = discord.Embed(title=f"🎙️ Voice Channels — {guild.name}", color=discord.Color.purple())
     any_found = False
     for vc in guild.voice_channels:
         if vc.members:
-            any_found = True
-            now = datetime.datetime.utcnow()
+            any_found   = True
+            now         = datetime.datetime.utcnow()
             member_list = []
             for m in vc.members:
                 if m.id in voice_track:
@@ -985,29 +933,27 @@ async def slash_whoinvoice(interaction: discord.Interaction):
                     member_list.append(f"{m.display_name} ({mins}m)")
                 else:
                     member_list.append(m.display_name)
-            embed.add_field(
-                name=f"🔊 {vc.name} ({len(vc.members)})",
-                value="\n".join(member_list),
-                inline=False
-            )
+            embed.add_field(name=f"🔊 {vc.name} ({len(vc.members)})", value="\n".join(member_list), inline=False)
     if not any_found:
         embed.description = "Nobody is in any voice channels right now."
     await interaction.response.send_message(embed=embed)
 
+# ── HELP ──────────────────────────────────────
 @bot.tree.command(name="help", description="Show all commands")
 async def slash_help(interaction: discord.Interaction):
     embed = discord.Embed(title="📖 All Commands", color=discord.Color.green(), description="Type `/` to see all commands with descriptions!")
-    embed.add_field(name="🎫 Tickets",    value="`/ticketsetup`", inline=False)
-    embed.add_field(name="🔨 Moderation", value="`/kick` `/ban` `/unban` `/mute` `/unmute` `/warn` `/warnings` `/clearwarnings` `/purge` `/slowmode` `/lock` `/unlock` `/nick`", inline=False)
-    embed.add_field(name="🏷️ Roles",      value="`/addrole` `/removerole`", inline=False)
-    embed.add_field(name="⚙️ Setup",      value="`/setautorole` `/setwelcome` `/setleave`", inline=False)
-    embed.add_field(name="🛡️ Auto-Mod",   value="`/automod` `/automodstatus` `/addbadword` `/removebadword` `/setminaccountage` `/setlogchannel`", inline=False)
-    embed.add_field(name="📈 Leveling",   value="`/level` `/leaderboard` `/setlevelchannel` `/resetxp`", inline=False)
-    embed.add_field(name="🎙️ Voice XP",   value="`/voicexp` `/whoinvoice` `/setvoicexplog`", inline=False)
-    embed.add_field(name="🎰 Slots",       value="`/slots` `/coinbalance` `/daily` `/givecoin`", inline=False)
-    embed.add_field(name="📊 Stats",       value="`/setupstats` `/removestats`", inline=False)
-    embed.add_field(name="😂 Fun",        value="`/8ball`", inline=False)
-    embed.add_field(name="ℹ️ Info",       value="`/userinfo` `/serverinfo` `/avatar` `/ping`", inline=False)
+    embed.add_field(name="🔑 NATIVE",      value="`/key`",                                                                                     inline=False)
+    embed.add_field(name="🎫 Tickets",     value="`/ticketsetup`",                                                                             inline=False)
+    embed.add_field(name="🔨 Moderation",  value="`/kick` `/ban` `/unban` `/mute` `/unmute` `/warn` `/warnings` `/clearwarnings` `/purge` `/slowmode` `/lock` `/unlock` `/nick`", inline=False)
+    embed.add_field(name="🏷️ Roles",       value="`/addrole` `/removerole`",                                                                   inline=False)
+    embed.add_field(name="⚙️ Setup",       value="`/setautorole` `/setwelcome` `/setleave`",                                                   inline=False)
+    embed.add_field(name="🛡️ Auto-Mod",    value="`/automod` `/automodstatus` `/addbadword` `/removebadword` `/setminaccountage` `/setlogchannel`", inline=False)
+    embed.add_field(name="📈 Leveling",    value="`/level` `/leaderboard` `/setlevelchannel` `/resetxp`",                                      inline=False)
+    embed.add_field(name="🎙️ Voice XP",    value="`/voicexp` `/whoinvoice` `/setvoicexplog`",                                                  inline=False)
+    embed.add_field(name="🎰 Slots",        value="`/slots` `/coinbalance` `/daily` `/givecoin`",                                               inline=False)
+    embed.add_field(name="📊 Stats",        value="`/setupstats` `/removestats`",                                                               inline=False)
+    embed.add_field(name="😂 Fun",         value="`/8ball` `/snipe`",                                                                          inline=False)
+    embed.add_field(name="ℹ️ Info",        value="`/userinfo` `/serverinfo` `/avatar` `/ping`",                                                inline=False)
     await interaction.response.send_message(embed=embed)
 
 # ══════════════════════════════════════════════
