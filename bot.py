@@ -47,7 +47,7 @@ def railway_hint(env_var, value):
 #  NATIVE KEY SYSTEM
 # ─────────────────────────────────────────────
 NATIVE_SECRET   = 0xA3F7_C291_5E6B_D840
-NATIVE_OWNER_ID = 1096099089076203530# ← Replace with your Discord user ID (right click your name → Copy User ID)
+NATIVE_OWNER_ID = 0  # ← Replace with your Discord user ID (right click your name → Copy User ID)
 
 def fnv64(data: bytes) -> int:
     h     = 0xcbf29ce484222325
