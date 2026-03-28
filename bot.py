@@ -417,8 +417,14 @@ async def slash_key(interaction: discord.Interaction, machine_id: str, duration:
         title="🔑 NATIVE License Key",
         color=discord.Color.from_rgb(0, 185, 255) if is_perm else discord.Color.from_rgb(255, 165, 0)
     )
+    # Build the paste string — includes expiry so macro can read it
+    if is_perm:
+        paste_key = key
+    else:
+        paste_key = f"{key}:{expiry_ts}"
+
     embed.add_field(name="Machine ID",  value=f"`{cleaned}`",                   inline=False)
-    embed.add_field(name="License Key", value=f"```{key}```",                   inline=False)
+    embed.add_field(name="License Key", value=f"```{paste_key}```",             inline=False)
     embed.add_field(name="Expires",     value=expiry_label,                     inline=False)
     if not is_perm:
         embed.add_field(name="Duration", value=format_duration(secs),           inline=True)
