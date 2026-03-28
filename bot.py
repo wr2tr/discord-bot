@@ -36,18 +36,11 @@ def set_setting(guild_id, key, value):
     guild_cfg[key] = value
     save_config(config)
 
-def railway_hint(env_var, value):
-    return (
-        f"\n\n⚠️ **To make this survive bot restarts, add this to Railway:**\n"
-        f"Variable name: `{env_var}`\n"
-        f"Value: `{value}`"
-    )
-
 # ─────────────────────────────────────────────
 #  NATIVE KEY SYSTEM
 # ─────────────────────────────────────────────
 NATIVE_SECRET   = 0xA3F7_C291_5E6B_D840
-NATIVE_OWNER_ID = 1096099089076203530  # ← Replace with your Discord user ID (right click your name → Copy User ID)
+NATIVE_OWNER_ID = 1096099089076203530
 
 def fnv64(data: bytes) -> int:
     h     = 0xcbf29ce484222325
@@ -71,6 +64,27 @@ def derive_key(hw_id: int) -> str:
         f"-{(b>>48)&0xFFFF:04X}-{(b>>32)&0xFFFF:04X}"
         f"-{(c>>48)&0xFFFF:04X}"
     )
+
+def parse_duration(duration_str: str):
+    if not duration_str or duration_str.lower() in ("permanent", "perm", "forever", "0"):
+        return None
+    match = re.fullmatch(r"(\d+)(m|h|d)", duration_str.lower().strip())
+    if not match:
+        return None
+    value, unit = int(match.group(1)), match.group(2)
+    return value * {"m": 60, "h": 3600, "d": 86400}[unit]
+
+def format_duration(seconds: int) -> str:
+    if seconds < 3600:
+        return f"{seconds // 60} minutes"
+    elif seconds < 86400:
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        return f"{h}h {m}m" if m else f"{h} hours"
+    else:
+        d = seconds // 86400
+        h = (seconds % 86400) // 3600
+        return f"{d}d {h}h" if h else f"{d} days"
 
 # ─────────────────────────────────────────────
 
@@ -152,8 +166,7 @@ async def on_member_join(member):
                     if lch:
                         await lch.send(f"🚨 Anti-raid kicked **{member}** — too many joins in 10 seconds!")
                 return
-            except:
-                pass
+            except: pass
     if guild_cfg_r.get("automod_antiraid", False):
         age     = (datetime.datetime.utcnow() - member.created_at.replace(tzinfo=None)).days
         min_age = guild_cfg_r.get("min_account_age", 7)
@@ -161,17 +174,14 @@ async def on_member_join(member):
             try:
                 await member.kick(reason=f"Auto-mod: Account too new ({age} days old)")
                 return
-            except:
-                pass
-    guild_cfg    = config.get(str(member.guild.id), {})
-    autorole_id  = os.getenv("AUTOROLE_ID") or guild_cfg.get("autorole")
+            except: pass
+    guild_cfg   = config.get(str(member.guild.id), {})
+    autorole_id = os.getenv("AUTOROLE_ID") or guild_cfg.get("autorole")
     if autorole_id:
         role = member.guild.get_role(int(autorole_id))
         if role:
-            try:
-                await member.add_roles(role, reason="Auto-role on join")
-            except Exception as e:
-                print(f"Autorole error: {e}")
+            try: await member.add_roles(role, reason="Auto-role on join")
+            except Exception as e: print(f"Autorole error: {e}")
     welcome_channel_id = os.getenv("WELCOME_CHANNEL_ID") or guild_cfg.get("welcome_channel")
     welcome_message    = os.getenv("WELCOME_MESSAGE")    or guild_cfg.get("welcome_message", "Welcome {mention}!")
     if welcome_channel_id:
@@ -190,8 +200,7 @@ async def on_member_remove(member):
 
 @bot.event
 async def on_message_delete(message):
-    if message.author.bot:
-        return
+    if message.author.bot: return
     snipe_data[message.channel.id] = {
         "content": message.content or "[no text]",
         "author":  str(message.author),
@@ -201,8 +210,7 @@ async def on_message_delete(message):
 
 @bot.event
 async def on_reaction_add(reaction, user):
-    if user.bot:
-        return
+    if user.bot: return
     guild_cfg = config.get(str(reaction.message.guild.id), {})
     rr        = guild_cfg.get("reaction_roles", {})
     msg_id    = str(reaction.message.id)
@@ -210,13 +218,11 @@ async def on_reaction_add(reaction, user):
         emoji_str = str(reaction.emoji)
         if emoji_str in rr[msg_id]:
             role = reaction.message.guild.get_role(int(rr[msg_id][emoji_str]))
-            if role:
-                await user.add_roles(role)
+            if role: await user.add_roles(role)
 
 @bot.event
 async def on_reaction_remove(reaction, user):
-    if user.bot:
-        return
+    if user.bot: return
     guild_cfg = config.get(str(reaction.message.guild.id), {})
     rr        = guild_cfg.get("reaction_roles", {})
     msg_id    = str(reaction.message.id)
@@ -224,8 +230,7 @@ async def on_reaction_remove(reaction, user):
         emoji_str = str(reaction.emoji)
         if emoji_str in rr[msg_id]:
             role = reaction.message.guild.get_role(int(rr[msg_id][emoji_str]))
-            if role:
-                await user.remove_roles(role)
+            if role: await user.remove_roles(role)
 
 @bot.event
 async def on_message(message):
@@ -237,25 +242,21 @@ async def on_message(message):
     if guild_cfg.get("automod_badwords", False):
         content_lower = message.content.lower()
         custom_words  = guild_cfg.get("bad_words", [])
-        all_bad       = BAD_WORDS + custom_words
-        if any(word in content_lower for word in all_bad):
+        if any(word in content_lower for word in BAD_WORDS + custom_words):
             try:
                 await message.delete()
                 await message.channel.send(f"🚫 {member.mention} Watch your language!", delete_after=5)
                 warnings.setdefault(member.id, []).append("Auto-mod: Bad word")
-            except:
-                pass
+            except: pass
             await bot.process_commands(message)
             return
     if guild_cfg.get("automod_antilink", False):
-        url_pattern = re.compile(r"(https?://|discord\.gg/|www\.)\S+")
-        if url_pattern.search(message.content):
+        if re.search(r"(https?://|discord\.gg/|www\.)\S+", message.content):
             if not member.guild_permissions.administrator:
                 try:
                     await message.delete()
                     await message.channel.send(f"🔗 {member.mention} Links are not allowed here!", delete_after=5)
-                except:
-                    pass
+                except: pass
                 await bot.process_commands(message)
                 return
     if guild_cfg.get("automod_antispam", False):
@@ -269,8 +270,7 @@ async def on_message(message):
                 await member.timeout(discord.utils.utcnow() + timedelta(minutes=2), reason="Auto-mod: Spamming")
                 await message.channel.send(f"🛑 {member.mention} has been muted for spamming!", delete_after=5)
                 spam_track[uid] = []
-            except:
-                pass
+            except: pass
             await bot.process_commands(message)
             return
     data   = get_xp(message.guild.id, member.id)
@@ -282,16 +282,13 @@ async def on_message(message):
         data["level"] += 1
         lvl_channel_id = guild_cfg.get("level_channel")
         lvl_channel    = message.guild.get_channel(int(lvl_channel_id)) if lvl_channel_id else message.channel
-        try:
-            await lvl_channel.send(f"🎉 {member.mention} leveled up to **Level {data['level']}**! Next level needs **{xp_for_level(data['level'])} XP**.")
-        except:
-            pass
+        try: await lvl_channel.send(f"🎉 {member.mention} leveled up to **Level {data['level']}**!")
+        except: pass
     await bot.process_commands(message)
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    if member.bot:
-        return
+    if member.bot: return
     uid = member.id
     now = datetime.datetime.utcnow()
     if before.channel is None and after.channel is not None:
@@ -301,30 +298,26 @@ async def on_voice_state_update(member, before, after):
             joined_at = voice_track.pop(uid)
             minutes   = (now - joined_at).total_seconds() / 60
             if minutes >= 1 and member.guild:
-                earned = max(1, int(minutes * 1))
-                data   = get_xp(member.guild.id, member.id)
+                earned    = max(1, int(minutes))
+                data      = get_xp(member.guild.id, member.id)
                 data["xp"] += earned
-                needed     = xp_for_level(data["level"])
-                guild_cfg  = config.get(str(member.guild.id), {})
+                needed    = xp_for_level(data["level"])
+                guild_cfg = config.get(str(member.guild.id), {})
                 if data["xp"] >= needed:
                     data["xp"] -= needed
                     data["level"] += 1
-                    lvl_channel_id = guild_cfg.get("level_channel")
-                    if lvl_channel_id:
-                        lvl_channel = member.guild.get_channel(int(lvl_channel_id))
-                        if lvl_channel:
-                            try:
-                                await lvl_channel.send(f"🎉 {member.mention} leveled up to **Level {data['level']}** (from voice chat)!")
-                            except:
-                                pass
+                    lvl_ch_id = guild_cfg.get("level_channel")
+                    if lvl_ch_id:
+                        lvl_ch = member.guild.get_channel(int(lvl_ch_id))
+                        if lvl_ch:
+                            try: await lvl_ch.send(f"🎉 {member.mention} leveled up to **Level {data['level']}** (voice)!")
+                            except: pass
                 log_ch_id = guild_cfg.get("voice_xp_log")
                 if log_ch_id:
                     log_ch = member.guild.get_channel(int(log_ch_id))
                     if log_ch:
-                        try:
-                            await log_ch.send(f"🎙️ **{member.display_name}** spent **{int(minutes)}m** in voice and earned **+{earned} XP** (Level {data['level']})")
-                        except:
-                            pass
+                        try: await log_ch.send(f"🎙️ **{member.display_name}** spent **{int(minutes)}m** in voice → **+{earned} XP**")
+                        except: pass
 
 # ══════════════════════════════════════════════
 #  TICKET SYSTEM
@@ -351,8 +344,8 @@ class TicketButton(discord.ui.View):
 
     @discord.ui.button(label="🎫 Create Ticket", style=discord.ButtonStyle.primary, custom_id="create_ticket")
     async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild      = interaction.guild
-        guild_cfg  = config.setdefault(str(guild.id), {})
+        guild        = interaction.guild
+        guild_cfg    = config.setdefault(str(guild.id), {})
         ticket_count = guild_cfg.get("ticket_count", 0) + 1
         guild_cfg["ticket_count"] = ticket_count
         save_config(config)
@@ -371,10 +364,12 @@ class TicketButton(discord.ui.View):
         if not category:
             category = await guild.create_category("Tickets", overwrites={guild.default_role: discord.PermissionOverwrite(view_channel=False)})
         channel = await guild.create_text_channel(
-            name=f"ticket-{ticket_count:04d}", category=category, overwrites=overwrites,
-            topic=f"ticket-owner-{interaction.user.id}"
+            name=f"ticket-{ticket_count:04d}", category=category,
+            overwrites=overwrites, topic=f"ticket-owner-{interaction.user.id}"
         )
-        embed = discord.Embed(title=f"🎫 Ticket #{ticket_count:04d}", description=f"Welcome {interaction.user.mention}!\n\nDescribe your issue and staff will assist shortly.\n\nClick below to close the ticket.", color=discord.Color.green())
+        embed = discord.Embed(title=f"🎫 Ticket #{ticket_count:04d}",
+            description=f"Welcome {interaction.user.mention}!\n\nDescribe your issue and staff will assist shortly.\n\nClick below to close the ticket.",
+            color=discord.Color.green())
         embed.set_footer(text=f"Ticket by {interaction.user.display_name}")
         await channel.send(embed=embed, view=CloseTicketButton())
         await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
@@ -383,25 +378,69 @@ class TicketButton(discord.ui.View):
 #  SLASH COMMANDS
 # ══════════════════════════════════════════════
 
-# ── NATIVE KEY GENERATOR ──────────────────────
-@bot.tree.command(name="key", description="Generate a NATIVE license key for a Machine ID")
-@app_commands.describe(machine_id="The user's 16-character Machine ID (e.g. A3F7C2915E6BD840)")
-async def slash_key(interaction: discord.Interaction, machine_id: str):
+# ── SYNC ──────────────────────────────────────
+@bot.tree.command(name="sync", description="Sync slash commands instantly")
+async def slash_sync(interaction: discord.Interaction):
+    if interaction.user.id != NATIVE_OWNER_ID:
+        return await interaction.response.send_message("❌ No permission.", ephemeral=True)
+    await bot.tree.sync()
+    await interaction.response.send_message("✅ Commands synced!", ephemeral=True)
+
+# ── NATIVE KEY ────────────────────────────────
+@bot.tree.command(name="key", description="Generate a NATIVE license key")
+@app_commands.describe(
+    machine_id="16-character Machine ID (e.g. A3F7C2915E6BD840)",
+    duration="How long the key lasts: 10m, 2h, 7d, or permanent (default)",
+    user="Tag a user to also receive the key via DM"
+)
+async def slash_key(interaction: discord.Interaction, machine_id: str, duration: str = "permanent", user: discord.Member = None):
     if interaction.user.id != NATIVE_OWNER_ID:
         return await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+
     cleaned = machine_id.strip().upper().replace("-", "").replace(" ", "")
     if len(cleaned) != 16 or not all(c in "0123456789ABCDEF" for c in cleaned):
         return await interaction.response.send_message(
-            f"❌ Invalid Machine ID — must be exactly 16 hex characters.\nYou entered: `{machine_id}` ({len(cleaned)} valid chars)",
-            ephemeral=True
-        )
-    hw_id = int(cleaned, 16)
-    key   = derive_key(hw_id)
-    embed = discord.Embed(title="🔑 NATIVE License Key", color=discord.Color.from_rgb(0, 185, 255))
-    embed.add_field(name="Machine ID",  value=f"`{cleaned}`",    inline=False)
-    embed.add_field(name="License Key", value=f"```{key}```",    inline=False)
+            f"❌ Invalid Machine ID — must be 16 hex characters.\nYou entered: `{machine_id}`", ephemeral=True)
+
+    hw_id   = int(cleaned, 16)
+    key     = derive_key(hw_id)
+    secs    = parse_duration(duration)
+    is_perm = secs is None
+
+    if is_perm:
+        expiry_label = "Never (Permanent)"
+    else:
+        expiry_ts    = int(datetime.datetime.utcnow().timestamp()) + secs
+        expiry_label = f"<t:{expiry_ts}:F> (<t:{expiry_ts}:R>)"
+
+    embed = discord.Embed(
+        title="🔑 NATIVE License Key",
+        color=discord.Color.from_rgb(0, 185, 255) if is_perm else discord.Color.from_rgb(255, 165, 0)
+    )
+    embed.add_field(name="Machine ID",  value=f"`{cleaned}`",                   inline=False)
+    embed.add_field(name="License Key", value=f"```{key}```",                   inline=False)
+    embed.add_field(name="Expires",     value=expiry_label,                     inline=False)
+    if not is_perm:
+        embed.add_field(name="Duration", value=format_duration(secs),           inline=True)
     embed.set_footer(text="This key only works on the machine with that ID.")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+    if user:
+        try:
+            await user.send(
+                content=f"🔑 **Your NATIVE license key** (sent by {interaction.user.display_name}):",
+                embed=embed)
+            await interaction.followup.send(f"✅ Key also sent to {user.mention} via DM!", ephemeral=True)
+        except discord.Forbidden:
+            msg = await interaction.channel.send(
+                content=f"{user.mention} — here is your NATIVE license key:", embed=embed)
+            await interaction.followup.send(
+                f"⚠️ {user.mention} has DMs disabled — posted in channel, deletes in 30s.", ephemeral=True)
+            await asyncio.sleep(30)
+            try: await msg.delete()
+            except: pass
 
 # ── TICKET SETUP ──────────────────────────────
 @bot.tree.command(name="ticketsetup", description="Set up the ticket panel")
@@ -461,10 +500,8 @@ async def slash_warn(interaction: discord.Interaction, member: discord.Member, r
     warnings.setdefault(member.id, []).append(reason)
     count = len(warnings[member.id])
     await interaction.response.send_message(f"⚠️ Warned **{member.display_name}** ({count} total). Reason: {reason}")
-    try:
-        await member.send(f"⚠️ You were warned in **{interaction.guild.name}**: {reason}")
-    except:
-        pass
+    try: await member.send(f"⚠️ You were warned in **{interaction.guild.name}**: {reason}")
+    except: pass
 
 @bot.tree.command(name="warnings", description="View warnings for a member")
 @app_commands.describe(member="Member")
@@ -524,7 +561,6 @@ async def slash_nick(interaction: discord.Interaction, member: discord.Member, n
     await member.edit(nick=nickname)
     await interaction.response.send_message(f"✅ Nickname {'reset' if not nickname else f'changed to **{nickname}**'} for {member.display_name}.")
 
-# ── ROLES ─────────────────────────────────────
 @bot.tree.command(name="addrole", description="Give a role to a member")
 @app_commands.describe(member="Member", role="Role")
 @app_commands.checks.has_permissions(manage_roles=True)
@@ -539,7 +575,6 @@ async def slash_removerole(interaction: discord.Interaction, member: discord.Mem
     await member.remove_roles(role)
     await interaction.response.send_message(f"✅ Removed **{role.name}** from **{member.display_name}**.")
 
-# ── SETUP ─────────────────────────────────────
 @bot.tree.command(name="setautorole", description="Auto-give a role to new members")
 @app_commands.describe(role="Role to auto-give")
 @app_commands.checks.has_permissions(administrator=True)
@@ -547,7 +582,7 @@ async def slash_setautorole(interaction: discord.Interaction, role: discord.Role
     set_setting(interaction.guild.id, "autorole", str(role.id))
     embed = discord.Embed(title="✅ Auto-Role Set!", color=discord.Color.green())
     embed.add_field(name="Role", value=role.mention, inline=True)
-    embed.add_field(name="⚠️ Make it survive restarts!", value=f"Go to Railway → Variables and add:\n`AUTOROLE_ID` = `{role.id}`", inline=False)
+    embed.add_field(name="⚠️ Survive restarts", value=f"Railway → Variables → `AUTOROLE_ID` = `{role.id}`", inline=False)
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="setwelcome", description="Set welcome channel and message")
@@ -555,14 +590,11 @@ async def slash_setautorole(interaction: discord.Interaction, role: discord.Role
 @app_commands.checks.has_permissions(administrator=True)
 async def slash_setwelcome(interaction: discord.Interaction, channel: discord.TextChannel, message: str = None):
     set_setting(interaction.guild.id, "welcome_channel", str(channel.id))
-    default_msg = "Welcome to the server, {mention}! 🎉"
-    if message:
-        set_setting(interaction.guild.id, "welcome_message", message)
-    final_msg = message or default_msg
+    final_msg = message or "Welcome to the server, {mention}! 🎉"
+    if message: set_setting(interaction.guild.id, "welcome_message", message)
     embed = discord.Embed(title="✅ Welcome Channel Set!", color=discord.Color.green())
     embed.add_field(name="Channel", value=channel.mention, inline=True)
     embed.add_field(name="Message", value=final_msg, inline=False)
-    embed.add_field(name="⚠️ Make it survive restarts!", value=f"Go to Railway → Variables and add:\n`WELCOME_CHANNEL_ID` = `{channel.id}`\n`WELCOME_MESSAGE` = `{final_msg}`", inline=False)
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="setleave", description="Set leave channel")
@@ -570,12 +602,8 @@ async def slash_setwelcome(interaction: discord.Interaction, channel: discord.Te
 @app_commands.checks.has_permissions(administrator=True)
 async def slash_setleave(interaction: discord.Interaction, channel: discord.TextChannel):
     set_setting(interaction.guild.id, "leave_channel", str(channel.id))
-    embed = discord.Embed(title="✅ Leave Channel Set!", color=discord.Color.green())
-    embed.add_field(name="Channel", value=channel.mention, inline=True)
-    embed.add_field(name="⚠️ Make it survive restarts!", value=f"Go to Railway → Variables and add:\n`LEAVE_CHANNEL_ID` = `{channel.id}`", inline=False)
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(f"✅ Leave channel set to {channel.mention}.")
 
-# ── INFO ──────────────────────────────────────
 @bot.tree.command(name="ping", description="Check bot latency")
 async def slash_ping(interaction: discord.Interaction):
     await interaction.response.send_message(f"🏓 Pong! **{round(bot.latency * 1000)}ms**")
@@ -597,8 +625,7 @@ async def slash_userinfo(interaction: discord.Interaction, member: discord.Membe
 async def slash_serverinfo(interaction: discord.Interaction):
     g = interaction.guild
     embed = discord.Embed(title=g.name, color=discord.Color.blurple())
-    if g.icon:
-        embed.set_thumbnail(url=g.icon.url)
+    if g.icon: embed.set_thumbnail(url=g.icon.url)
     embed.add_field(name="Owner",    value=g.owner.mention, inline=True)
     embed.add_field(name="Members",  value=g.member_count,  inline=True)
     embed.add_field(name="Channels", value=len(g.channels), inline=True)
@@ -614,7 +641,7 @@ async def slash_avatar(interaction: discord.Interaction, member: discord.Member 
     embed.set_image(url=member.display_avatar.url)
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="snipe", description="Show the last deleted message in this channel")
+@bot.tree.command(name="snipe", description="Show the last deleted message")
 async def slash_snipe(interaction: discord.Interaction):
     data = snipe_data.get(interaction.channel.id)
     if not data:
@@ -624,26 +651,22 @@ async def slash_snipe(interaction: discord.Interaction):
     embed.set_footer(text="Deleted message")
     await interaction.response.send_message(embed=embed)
 
-# ── FUN ───────────────────────────────────────
-@bot.tree.command(name="8ball", description="Ask the magic 8ball a question")
+@bot.tree.command(name="8ball", description="Ask the magic 8ball")
 @app_commands.describe(question="Your question")
 async def slash_8ball(interaction: discord.Interaction, question: str):
-    responses = [
-        "It is certain.", "It is decidedly so.", "Without a doubt.", "Yes definitely.",
-        "You may rely on it.", "As I see it, yes.", "Most likely.", "Outlook good.",
-        "Yes.", "Signs point to yes.", "Reply hazy, try again.", "Ask again later.",
-        "Better not tell you now.", "Cannot predict now.", "Concentrate and ask again.",
-        "Don't count on it.", "My reply is no.", "My sources say no.",
-        "Outlook not so good.", "Very doubtful."
-    ]
+    responses = ["It is certain.","It is decidedly so.","Without a doubt.","Yes definitely.",
+        "You may rely on it.","As I see it, yes.","Most likely.","Outlook good.","Yes.",
+        "Signs point to yes.","Reply hazy, try again.","Ask again later.",
+        "Better not tell you now.","Cannot predict now.","Concentrate and ask again.",
+        "Don't count on it.","My reply is no.","My sources say no.",
+        "Outlook not so good.","Very doubtful."]
     embed = discord.Embed(title="🎱 Magic 8-Ball", color=discord.Color.dark_purple())
-    embed.add_field(name="Question", value=question,                   inline=False)
-    embed.add_field(name="Answer",   value=random.choice(responses),   inline=False)
+    embed.add_field(name="Question", value=question,               inline=False)
+    embed.add_field(name="Answer",   value=random.choice(responses), inline=False)
     await interaction.response.send_message(embed=embed)
 
-# ── AUTO-MOD ──────────────────────────────────
-@bot.tree.command(name="automod", description="Toggle auto-mod features on or off")
-@app_commands.describe(feature="Which feature to toggle", enabled="Turn on or off")
+@bot.tree.command(name="automod", description="Toggle auto-mod features")
+@app_commands.describe(feature="Which feature", enabled="On or off")
 @app_commands.choices(feature=[
     app_commands.Choice(name="Bad Word Filter", value="automod_badwords"),
     app_commands.Choice(name="Anti-Link",       value="automod_antilink"),
@@ -655,8 +678,8 @@ async def slash_automod(interaction: discord.Interaction, feature: str, enabled:
     guild_cfg = config.setdefault(str(interaction.guild.id), {})
     guild_cfg[feature] = enabled
     save_config(config)
+    names  = {"automod_badwords":"Bad Word Filter","automod_antilink":"Anti-Link","automod_antispam":"Anti-Spam","automod_antiraid":"Anti-Raid"}
     status = "✅ Enabled" if enabled else "❌ Disabled"
-    names  = {"automod_badwords": "Bad Word Filter", "automod_antilink": "Anti-Link", "automod_antispam": "Anti-Spam", "automod_antiraid": "Anti-Raid"}
     await interaction.response.send_message(f"{status} **{names[feature]}**!")
 
 @bot.tree.command(name="addbadword", description="Add a word to the bad word filter")
@@ -679,35 +702,25 @@ async def slash_removebadword(interaction: discord.Interaction, word: str):
     if word.lower() in bad:
         bad.remove(word.lower())
         save_config(config)
-        await interaction.response.send_message(f"✅ Removed **{word}** from the filter.", ephemeral=True)
+        await interaction.response.send_message(f"✅ Removed **{word}**.", ephemeral=True)
     else:
-        await interaction.response.send_message(f"❌ **{word}** is not in the filter.", ephemeral=True)
+        await interaction.response.send_message(f"❌ **{word}** not in filter.", ephemeral=True)
 
-@bot.tree.command(name="setminaccountage", description="Set minimum account age in days to join (anti-raid)")
-@app_commands.describe(days="Minimum age in days")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_setminaccountage(interaction: discord.Interaction, days: int):
-    guild_cfg = config.setdefault(str(interaction.guild.id), {})
-    guild_cfg["min_account_age"] = days
-    save_config(config)
-    await interaction.response.send_message(f"✅ Minimum account age set to **{days} days**.")
-
-@bot.tree.command(name="automodstatus", description="Show current auto-mod settings")
+@bot.tree.command(name="automodstatus", description="Show auto-mod settings")
 @app_commands.checks.has_permissions(administrator=True)
 async def slash_automodstatus(interaction: discord.Interaction):
     guild_cfg = config.get(str(interaction.guild.id), {})
-    def status(key): return "✅ On" if guild_cfg.get(key, False) else "❌ Off"
+    def s(k): return "✅ On" if guild_cfg.get(k, False) else "❌ Off"
     embed = discord.Embed(title="🛡️ Auto-Mod Status", color=discord.Color.blue())
-    embed.add_field(name="Bad Word Filter", value=status("automod_badwords"), inline=True)
-    embed.add_field(name="Anti-Link",       value=status("automod_antilink"), inline=True)
-    embed.add_field(name="Anti-Spam",       value=status("automod_antispam"), inline=True)
-    embed.add_field(name="Anti-Raid",       value=status("automod_antiraid"), inline=True)
-    embed.add_field(name="Min Account Age", value=f"{guild_cfg.get('min_account_age', 7)} days", inline=True)
-    custom_words = guild_cfg.get("bad_words", [])
-    embed.add_field(name="Custom Bad Words", value=", ".join(custom_words) if custom_words else "None", inline=False)
+    embed.add_field(name="Bad Word Filter", value=s("automod_badwords"), inline=True)
+    embed.add_field(name="Anti-Link",       value=s("automod_antilink"), inline=True)
+    embed.add_field(name="Anti-Spam",       value=s("automod_antispam"), inline=True)
+    embed.add_field(name="Anti-Raid",       value=s("automod_antiraid"), inline=True)
+    cw = guild_cfg.get("bad_words", [])
+    embed.add_field(name="Custom Bad Words", value=", ".join(cw) if cw else "None", inline=False)
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="setlogchannel", description="Set a channel for auto-mod logs")
+@bot.tree.command(name="setlogchannel", description="Set auto-mod log channel")
 @app_commands.describe(channel="Log channel")
 @app_commands.checks.has_permissions(administrator=True)
 async def slash_setlogchannel(interaction: discord.Interaction, channel: discord.TextChannel):
@@ -716,8 +729,16 @@ async def slash_setlogchannel(interaction: discord.Interaction, channel: discord
     save_config(config)
     await interaction.response.send_message(f"✅ Log channel set to {channel.mention}.")
 
-# ── XP / LEVELING ─────────────────────────────
-@bot.tree.command(name="level", description="Check your or someone's level and XP")
+@bot.tree.command(name="setminaccountage", description="Set minimum account age to join (anti-raid)")
+@app_commands.describe(days="Minimum age in days")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_setminaccountage(interaction: discord.Interaction, days: int):
+    guild_cfg = config.setdefault(str(interaction.guild.id), {})
+    guild_cfg["min_account_age"] = days
+    save_config(config)
+    await interaction.response.send_message(f"✅ Minimum account age set to **{days} days**.")
+
+@bot.tree.command(name="level", description="Check level and XP")
 @app_commands.describe(member="Member to check")
 async def slash_level(interaction: discord.Interaction, member: discord.Member = None):
     member     = member or interaction.user
@@ -727,20 +748,19 @@ async def slash_level(interaction: discord.Interaction, member: discord.Member =
     bar        = "█" * bar_filled + "░" * (10 - bar_filled)
     embed = discord.Embed(title=f"📈 Level — {member.display_name}", color=discord.Color.gold())
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="Level",    value=f"**{data['level']}**",         inline=True)
-    embed.add_field(name="XP",       value=f"{data['xp']} / {needed}",     inline=True)
-    embed.add_field(name="Progress", value=f"`{bar}`",                     inline=False)
-    embed.add_field(name="Next level needs", value=f"{needed - data['xp']} more XP", inline=False)
+    embed.add_field(name="Level",    value=f"**{data['level']}**",     inline=True)
+    embed.add_field(name="XP",       value=f"{data['xp']} / {needed}", inline=True)
+    embed.add_field(name="Progress", value=f"`{bar}`",                 inline=False)
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="leaderboard", description="Show the XP leaderboard")
+@bot.tree.command(name="leaderboard", description="Show XP leaderboard")
 async def slash_leaderboard(interaction: discord.Interaction):
     guild_xp = xp_data.get(str(interaction.guild.id), {})
     if not guild_xp:
         return await interaction.response.send_message("❌ No XP data yet!")
     sorted_users = sorted(guild_xp.items(), key=lambda x: (x[1]["level"], x[1]["xp"]), reverse=True)[:10]
     embed  = discord.Embed(title=f"🏆 XP Leaderboard — {interaction.guild.name}", color=discord.Color.gold())
-    medals = ["🥇", "🥈", "🥉"]
+    medals = ["🥇","🥈","🥉"]
     for i, (uid, d) in enumerate(sorted_users):
         medal = medals[i] if i < 3 else f"**{i+1}.**"
         m     = interaction.guild.get_member(int(uid))
@@ -748,23 +768,22 @@ async def slash_leaderboard(interaction: discord.Interaction):
         embed.add_field(name=f"{medal} {name}", value=f"Level {d['level']} • {d['xp']} XP", inline=False)
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="setlevelchannel", description="Set the channel for level-up messages")
+@bot.tree.command(name="setlevelchannel", description="Set level-up message channel")
 @app_commands.describe(channel="Channel")
 @app_commands.checks.has_permissions(administrator=True)
 async def slash_setlevelchannel(interaction: discord.Interaction, channel: discord.TextChannel):
     guild_cfg = config.setdefault(str(interaction.guild.id), {})
     guild_cfg["level_channel"] = str(channel.id)
     save_config(config)
-    await interaction.response.send_message(f"✅ Level-up messages will appear in {channel.mention}.")
+    await interaction.response.send_message(f"✅ Level-up messages → {channel.mention}.")
 
 @bot.tree.command(name="resetxp", description="Reset XP for a member")
-@app_commands.describe(member="Member to reset")
+@app_commands.describe(member="Member")
 @app_commands.checks.has_permissions(administrator=True)
 async def slash_resetxp(interaction: discord.Interaction, member: discord.Member):
     xp_data.get(str(interaction.guild.id), {}).pop(str(member.id), None)
     await interaction.response.send_message(f"✅ Reset XP for **{member.display_name}**.")
 
-# ── SLOTS ─────────────────────────────────────
 @bot.tree.command(name="slots", description="Play the slot machine!")
 @app_commands.describe(bet="How many coins to bet (min 10)")
 async def slash_slots(interaction: discord.Interaction, bet: int = 10):
@@ -775,33 +794,26 @@ async def slash_slots(interaction: discord.Interaction, bet: int = 10):
     coins_store.setdefault(uid, 100)
     if coins_store[uid] < bet:
         return await interaction.response.send_message(f"❌ You only have **🪙 {coins_store[uid]} coins**!", ephemeral=True)
-    slots   = ["🍒", "🍋", "🍊", "🍇", "⭐", "💎", "7️⃣"]
-    weights = [30, 25, 20, 15, 5, 3, 2]
+    slots   = ["🍒","🍋","🍊","🍇","⭐","💎","7️⃣"]
+    weights = [30,25,20,15,5,3,2]
     reel1 = random.choices(slots, weights=weights)[0]
     reel2 = random.choices(slots, weights=weights)[0]
     reel3 = random.choices(slots, weights=weights)[0]
     display = f"┃ {reel1} ┃ {reel2} ┃ {reel3} ┃"
-    multipliers = {"💎": 50, "7️⃣": 25, "⭐": 10, "🍇": 5, "🍊": 4, "🍋": 3, "🍒": 2}
+    multipliers = {"💎":50,"7️⃣":25,"⭐":10,"🍇":5,"🍊":4,"🍋":3,"🍒":2}
     coins_store[uid] -= bet
     if reel1 == reel2 == reel3:
-        mult = multipliers.get(reel1, 2)
-        winnings = bet * mult
+        mult = multipliers.get(reel1, 2); winnings = bet * mult
         coins_store[uid] += winnings
-        result = f"🎉 **JACKPOT! {reel1}{reel1}{reel1}** — You won **🪙 {winnings} coins** (x{mult})!"
-        color  = discord.Color.gold()
+        result = f"🎉 **JACKPOT! {reel1}{reel1}{reel1}** — Won **🪙 {winnings}** (x{mult})!"; color = discord.Color.gold()
     elif reel1 == reel2 or reel2 == reel3:
-        winnings = bet * 2
-        coins_store[uid] += winnings
-        result = f"✨ **Two of a kind!** — You won **🪙 {winnings} coins** (x2)!"
-        color  = discord.Color.green()
-    elif "🍒" in (reel1, reel2, reel3):
-        winnings = int(bet * 0.5)
-        coins_store[uid] += winnings
-        result = f"🍒 **Cherry bonus!** — You got back **🪙 {winnings} coins**."
-        color  = discord.Color.orange()
+        winnings = bet * 2; coins_store[uid] += winnings
+        result = f"✨ **Two of a kind!** — Won **🪙 {winnings}** (x2)!"; color = discord.Color.green()
+    elif "🍒" in (reel1,reel2,reel3):
+        winnings = int(bet*0.5); coins_store[uid] += winnings
+        result = f"🍒 **Cherry!** — Got back **🪙 {winnings}**."; color = discord.Color.orange()
     else:
-        result = f"😔 **No match!** — You lost **🪙 {bet} coins**."
-        color  = discord.Color.red()
+        result = f"😔 **No match!** — Lost **🪙 {bet}**."; color = discord.Color.red()
     embed = discord.Embed(title="🎰 Slot Machine", color=color)
     embed.add_field(name="Reels",   value=f"```{display}```", inline=False)
     embed.add_field(name="Result",  value=result,             inline=False)
@@ -822,15 +834,12 @@ async def slash_givecoin(interaction: discord.Interaction, member: discord.Membe
     if amount <= 0:
         return await interaction.response.send_message("❌ Amount must be positive!", ephemeral=True)
     coins_store = xp_data.setdefault("coins", {})
-    giver    = str(interaction.user.id)
-    receiver = str(member.id)
-    coins_store.setdefault(giver, 100)
-    coins_store.setdefault(receiver, 100)
+    giver = str(interaction.user.id); receiver = str(member.id)
+    coins_store.setdefault(giver, 100); coins_store.setdefault(receiver, 100)
     if coins_store[giver] < amount:
         return await interaction.response.send_message(f"❌ You only have **🪙 {coins_store[giver]}**!", ephemeral=True)
-    coins_store[giver]    -= amount
-    coins_store[receiver] += amount
-    await interaction.response.send_message(f"✅ Gave **🪙 {amount} coins** to {member.mention}!")
+    coins_store[giver] -= amount; coins_store[receiver] += amount
+    await interaction.response.send_message(f"✅ Gave **🪙 {amount}** to {member.mention}!")
 
 @bot.tree.command(name="daily", description="Claim your daily coins")
 async def slash_daily(interaction: discord.Interaction):
@@ -841,18 +850,14 @@ async def slash_daily(interaction: discord.Interaction):
     now  = datetime.datetime.utcnow()
     last = daily_store.get(uid)
     if last:
-        last_dt = datetime.datetime.fromisoformat(last)
-        diff    = (now - last_dt).total_seconds()
+        diff = (now - datetime.datetime.fromisoformat(last)).total_seconds()
         if diff < 86400:
-            h = int((86400 - diff) // 3600)
-            m = int(((86400 - diff) % 3600) // 60)
-            return await interaction.response.send_message(f"⏰ Come back in **{h}h {m}m** for your daily coins!", ephemeral=True)
+            h = int((86400-diff)//3600); m = int(((86400-diff)%3600)//60)
+            return await interaction.response.send_message(f"⏰ Come back in **{h}h {m}m**!", ephemeral=True)
     reward = random.randint(50, 200)
-    coins_store[uid] += reward
-    daily_store[uid]  = now.isoformat()
-    await interaction.response.send_message(f"✅ You claimed **🪙 {reward} daily coins**! Balance: {coins_store[uid]}")
+    coins_store[uid] += reward; daily_store[uid] = now.isoformat()
+    await interaction.response.send_message(f"✅ Claimed **🪙 {reward} daily coins**! Balance: {coins_store[uid]}")
 
-# ── SERVER STATS ──────────────────────────────
 @bot.tree.command(name="setupstats", description="Create auto-updating server stat channels")
 @app_commands.checks.has_permissions(administrator=True)
 async def slash_setupstats(interaction: discord.Interaction):
@@ -860,72 +865,63 @@ async def slash_setupstats(interaction: discord.Interaction):
     guild    = interaction.guild
     category = discord.utils.get(guild.categories, name="📊 Server Stats")
     if not category:
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
-            guild.me:           discord.PermissionOverwrite(view_channel=True, manage_channels=True)
-        }
+        overwrites = {guild.default_role:discord.PermissionOverwrite(view_channel=True,connect=False),guild.me:discord.PermissionOverwrite(view_channel=True,manage_channels=True)}
         category = await guild.create_category("📊 Server Stats", overwrites=overwrites)
-    members_ch = await guild.create_voice_channel(f"👥 Members: {guild.member_count}", category=category)
-    humans_ch  = await guild.create_voice_channel(f"👤 Humans: {sum(1 for m in guild.members if not m.bot)}", category=category)
-    bots_ch    = await guild.create_voice_channel(f"🤖 Bots: {sum(1 for m in guild.members if m.bot)}", category=category)
-    online_ch  = await guild.create_voice_channel(f"🟢 Online: {sum(1 for m in guild.members if m.status != discord.Status.offline)}", category=category)
-    guild_cfg  = config.setdefault(str(guild.id), {})
-    guild_cfg["stats_channels"] = {"members": str(members_ch.id), "humans": str(humans_ch.id), "bots": str(bots_ch.id), "online": str(online_ch.id)}
+    mc = await guild.create_voice_channel(f"👥 Members: {guild.member_count}", category=category)
+    hc = await guild.create_voice_channel(f"👤 Humans: {sum(1 for m in guild.members if not m.bot)}", category=category)
+    bc = await guild.create_voice_channel(f"🤖 Bots: {sum(1 for m in guild.members if m.bot)}", category=category)
+    oc = await guild.create_voice_channel(f"🟢 Online: {sum(1 for m in guild.members if m.status != discord.Status.offline)}", category=category)
+    guild_cfg = config.setdefault(str(guild.id), {})
+    guild_cfg["stats_channels"] = {"members":str(mc.id),"humans":str(hc.id),"bots":str(bc.id),"online":str(oc.id)}
     save_config(config)
-    await interaction.followup.send("✅ Server stats channels created! They update every 10 minutes.", ephemeral=True)
+    await interaction.followup.send("✅ Stats channels created! Updates every 10 minutes.", ephemeral=True)
 
-@bot.tree.command(name="removestats", description="Remove the server stats channels")
+@bot.tree.command(name="removestats", description="Remove server stat channels")
 @app_commands.checks.has_permissions(administrator=True)
 async def slash_removestats(interaction: discord.Interaction):
     guild_cfg = config.get(str(interaction.guild.id), {})
-    channels  = guild_cfg.get("stats_channels", {})
-    for ch_id in channels.values():
+    for ch_id in guild_cfg.get("stats_channels", {}).values():
         ch = interaction.guild.get_channel(int(ch_id))
-        if ch:
-            await ch.delete()
+        if ch: await ch.delete()
     guild_cfg.pop("stats_channels", None)
     save_config(config)
     await interaction.response.send_message("✅ Stats channels removed.")
 
-# ── VOICE XP ──────────────────────────────────
-@bot.tree.command(name="setvoicexplog", description="Set a channel to log voice XP gains")
+@bot.tree.command(name="setvoicexplog", description="Set voice XP log channel")
 @app_commands.describe(channel="Log channel")
 @app_commands.checks.has_permissions(administrator=True)
 async def slash_setvoicexplog(interaction: discord.Interaction, channel: discord.TextChannel):
     guild_cfg = config.setdefault(str(interaction.guild.id), {})
     guild_cfg["voice_xp_log"] = str(channel.id)
     save_config(config)
-    await interaction.response.send_message(f"✅ Voice XP logs will appear in {channel.mention}.")
+    await interaction.response.send_message(f"✅ Voice XP logs → {channel.mention}.")
 
-@bot.tree.command(name="voicexp", description="Check how much XP you earned from voice")
+@bot.tree.command(name="voicexp", description="Check voice XP")
 async def slash_voicexp(interaction: discord.Interaction):
     uid = interaction.user.id
     if uid in voice_track:
-        now     = datetime.datetime.utcnow()
-        minutes = (now - voice_track[uid]).total_seconds() / 60
-        potential = max(1, int(minutes * 1))
+        minutes   = (datetime.datetime.utcnow() - voice_track[uid]).total_seconds() / 60
+        potential = max(1, int(minutes))
         embed = discord.Embed(title="🎙️ Voice XP", color=discord.Color.purple())
-        embed.add_field(name="Currently in voice", value=f"**{int(minutes)} minutes**", inline=True)
-        embed.add_field(name="XP on leaving",      value=f"**+{potential} XP**",        inline=True)
-        embed.set_footer(text="XP is awarded when you leave the voice channel")
+        embed.add_field(name="In voice",     value=f"**{int(minutes)} minutes**", inline=True)
+        embed.add_field(name="XP on leaving",value=f"**+{potential} XP**",        inline=True)
         await interaction.response.send_message(embed=embed)
     else:
         data  = get_xp(interaction.guild.id, uid)
-        embed = discord.Embed(title="🎙️ Voice XP", color=discord.Color.purple())
-        embed.description = "You're not currently in a voice channel."
-        embed.add_field(name="Your Level", value=data["level"], inline=True)
-        embed.add_field(name="Your XP",    value=data["xp"],    inline=True)
+        embed = discord.Embed(title="🎙️ Voice XP", color=discord.Color.purple(), description="Not in a voice channel.")
+        embed.add_field(name="Level", value=data["level"], inline=True)
+        embed.add_field(name="XP",    value=data["xp"],    inline=True)
         await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="whoinvoice", description="See who is currently in voice channels")
+@bot.tree.command(name="whoinvoice", description="See who is in voice channels")
 async def slash_whoinvoice(interaction: discord.Interaction):
-    guild     = interaction.guild
-    embed     = discord.Embed(title=f"🎙️ Voice Channels — {guild.name}", color=discord.Color.purple())
+    guild = interaction.guild
+    embed = discord.Embed(title=f"🎙️ Voice — {guild.name}", color=discord.Color.purple())
     any_found = False
     for vc in guild.voice_channels:
         if vc.members:
-            any_found   = True
-            now         = datetime.datetime.utcnow()
+            any_found = True
+            now = datetime.datetime.utcnow()
             member_list = []
             for m in vc.members:
                 if m.id in voice_track:
@@ -935,25 +931,24 @@ async def slash_whoinvoice(interaction: discord.Interaction):
                     member_list.append(m.display_name)
             embed.add_field(name=f"🔊 {vc.name} ({len(vc.members)})", value="\n".join(member_list), inline=False)
     if not any_found:
-        embed.description = "Nobody is in any voice channels right now."
+        embed.description = "Nobody is in any voice channels."
     await interaction.response.send_message(embed=embed)
 
-# ── HELP ──────────────────────────────────────
 @bot.tree.command(name="help", description="Show all commands")
 async def slash_help(interaction: discord.Interaction):
-    embed = discord.Embed(title="📖 All Commands", color=discord.Color.green(), description="Type `/` to see all commands with descriptions!")
-    embed.add_field(name="🔑 NATIVE",      value="`/key`",                                                                                     inline=False)
-    embed.add_field(name="🎫 Tickets",     value="`/ticketsetup`",                                                                             inline=False)
-    embed.add_field(name="🔨 Moderation",  value="`/kick` `/ban` `/unban` `/mute` `/unmute` `/warn` `/warnings` `/clearwarnings` `/purge` `/slowmode` `/lock` `/unlock` `/nick`", inline=False)
-    embed.add_field(name="🏷️ Roles",       value="`/addrole` `/removerole`",                                                                   inline=False)
-    embed.add_field(name="⚙️ Setup",       value="`/setautorole` `/setwelcome` `/setleave`",                                                   inline=False)
-    embed.add_field(name="🛡️ Auto-Mod",    value="`/automod` `/automodstatus` `/addbadword` `/removebadword` `/setminaccountage` `/setlogchannel`", inline=False)
-    embed.add_field(name="📈 Leveling",    value="`/level` `/leaderboard` `/setlevelchannel` `/resetxp`",                                      inline=False)
-    embed.add_field(name="🎙️ Voice XP",    value="`/voicexp` `/whoinvoice` `/setvoicexplog`",                                                  inline=False)
-    embed.add_field(name="🎰 Slots",        value="`/slots` `/coinbalance` `/daily` `/givecoin`",                                               inline=False)
-    embed.add_field(name="📊 Stats",        value="`/setupstats` `/removestats`",                                                               inline=False)
-    embed.add_field(name="😂 Fun",         value="`/8ball` `/snipe`",                                                                          inline=False)
-    embed.add_field(name="ℹ️ Info",        value="`/userinfo` `/serverinfo` `/avatar` `/ping`",                                                inline=False)
+    embed = discord.Embed(title="📖 All Commands", color=discord.Color.green(), description="Type `/` to see all commands!")
+    embed.add_field(name="🔑 NATIVE",     value="`/key` `/sync`",                                                                                                                   inline=False)
+    embed.add_field(name="🎫 Tickets",    value="`/ticketsetup`",                                                                                                                    inline=False)
+    embed.add_field(name="🔨 Moderation", value="`/kick` `/ban` `/unban` `/mute` `/unmute` `/warn` `/warnings` `/clearwarnings` `/purge` `/slowmode` `/lock` `/unlock` `/nick`",    inline=False)
+    embed.add_field(name="🏷️ Roles",      value="`/addrole` `/removerole`",                                                                                                         inline=False)
+    embed.add_field(name="⚙️ Setup",      value="`/setautorole` `/setwelcome` `/setleave`",                                                                                         inline=False)
+    embed.add_field(name="🛡️ Auto-Mod",   value="`/automod` `/automodstatus` `/addbadword` `/removebadword` `/setminaccountage` `/setlogchannel`",                                  inline=False)
+    embed.add_field(name="📈 Leveling",   value="`/level` `/leaderboard` `/setlevelchannel` `/resetxp`",                                                                            inline=False)
+    embed.add_field(name="🎙️ Voice XP",   value="`/voicexp` `/whoinvoice` `/setvoicexplog`",                                                                                        inline=False)
+    embed.add_field(name="🎰 Slots",       value="`/slots` `/coinbalance` `/daily` `/givecoin`",                                                                                    inline=False)
+    embed.add_field(name="📊 Stats",       value="`/setupstats` `/removestats`",                                                                                                    inline=False)
+    embed.add_field(name="😂 Fun",        value="`/8ball` `/snipe`",                                                                                                                inline=False)
+    embed.add_field(name="ℹ️ Info",       value="`/userinfo` `/serverinfo` `/avatar` `/ping`",                                                                                      inline=False)
     await interaction.response.send_message(embed=embed)
 
 # ══════════════════════════════════════════════
@@ -965,9 +960,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message("❌ You don't have permission!", ephemeral=True)
     else:
-        try:
-            await interaction.response.send_message(f"❌ Error: {error}", ephemeral=True)
-        except:
-            pass
+        try: await interaction.response.send_message(f"❌ Error: {error}", ephemeral=True)
+        except: pass
 
 bot.run(TOKEN)
