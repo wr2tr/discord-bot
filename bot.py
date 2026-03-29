@@ -4,6 +4,7 @@ from discord import app_commands
 import json, os, random, re, datetime
 from datetime import timedelta
 import asyncio
+from aiohttp import web
 
 # ─────────────────────────────────────────────
 #  CONFIG
@@ -982,4 +983,26 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         try: await interaction.response.send_message(f"❌ Error: {error}", ephemeral=True)
         except: pass
 
-bot.run(TOKEN)
+
+# ── Ban list HTTP server ──────────────────────────────────────────────────────
+# The macro GETs /bans every 10s to check if its HWID is banned
+async def handle_bans(request):
+    text = "\n".join(sorted(banned_hwids))
+    return web.Response(text=text, content_type="text/plain")
+
+async def start_http_server():
+    app = web.Application()
+    app.router.add_get("/bans", handle_bans)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Ban list server running on port {port}")
+
+async def main():
+    async with bot:
+        await start_http_server()
+        await bot.start(TOKEN)
+
+asyncio.run(main())
