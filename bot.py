@@ -117,6 +117,7 @@ def xp_for_level(level):
 
 @bot.event
 async def on_ready():
+    bot.add_view(VerifyButton())  # re-register persistent verify button
     bot.add_view(TicketButton())
     bot.add_view(CloseTicketButton())
     update_stats.start()
@@ -149,6 +150,140 @@ async def update_stats():
                 if ch: await ch.edit(name=f"🟢 Online: {online}")
         except Exception as e:
             print(f"Stats update error: {e}")
+
+
+# ─────────────────────────────────────────────
+#  VERIFICATION SYSTEM
+# ─────────────────────────────────────────────
+
+class VerifyButton(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)  # persistent across restarts
+
+    @discord.ui.button(label="✅  Verify", style=discord.ButtonStyle.green, custom_id="verify_button")
+    async def verify(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_cfg = config.get(str(interaction.guild_id), {})
+        role_id   = guild_cfg.get("verify_role")
+        if not role_id:
+            await interaction.response.send_message(
+                "❌ Verification role not set. Ask an admin to run `/setverifyrole`.",
+                ephemeral=True)
+            return
+        role = interaction.guild.get_role(int(role_id))
+        if not role:
+            await interaction.response.send_message("❌ Role not found.", ephemeral=True)
+            return
+        if role in interaction.user.roles:
+            await interaction.response.send_message("✅ You're already verified!", ephemeral=True)
+            return
+        try:
+            await interaction.user.add_roles(role, reason="Verified via button")
+            await interaction.response.send_message(
+                f"✅ You've been verified and given the **{role.name}** role!", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "❌ I don't have permission to assign that role.", ephemeral=True)
+
+
+@bot.tree.command(name="sendverify", description="Send the verification message in this channel")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def sendverify(interaction: discord.Interaction):
+    guild_cfg = config.get(str(interaction.guild_id), {})
+    role_id   = guild_cfg.get("verify_role")
+    if not role_id:
+        await interaction.response.send_message(
+            "❌ Set a verify role first with `/setverifyrole`.", ephemeral=True)
+        return
+    embed = discord.Embed(
+        title="🔒  Verification",
+        description=(
+            "Welcome to **NATIVE**!\n\n"
+            "Click the button below to verify yourself and gain access to the server."
+        ),
+        color=discord.Color.from_rgb(0, 185, 255)
+    )
+    embed.set_footer(text="NATIVE • Click once to verify")
+    await interaction.channel.send(embed=embed, view=VerifyButton())
+    await interaction.response.send_message("✅ Verification message sent!", ephemeral=True)
+
+
+@bot.tree.command(name="setverifyrole", description="Set the role given when someone verifies")
+@app_commands.describe(role="The role to give verified members")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setverifyrole(interaction: discord.Interaction, role: discord.Role):
+    set_setting(interaction.guild_id, "verify_role", str(role.id))
+    await interaction.response.send_message(
+        f"✅ Verify role set to **{role.name}**.", ephemeral=True)
+
+
+@bot.tree.command(name="setupverify", description="Fully sets up verification — creates role, locks channels, sends verify message")
+@app_commands.checks.has_permissions(administrator=True)
+async def setupverify(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    steps = []
+
+    # 1. Create or find Member role
+    member_role = discord.utils.get(guild.roles, name="Member")
+    if not member_role:
+        member_role = await guild.create_role(
+            name="Member",
+            color=discord.Color.from_rgb(0, 185, 255),
+            reason="NATIVE verify setup"
+        )
+        steps.append("✅ Created **Member** role")
+    else:
+        steps.append("✅ Found existing **Member** role")
+
+    # 2. Save the role in config
+    set_setting(guild.id, "verify_role", str(member_role.id))
+    steps.append("✅ Saved verify role to config")
+
+    # 3. Lock all channels — deny @everyone, allow Member role
+    everyone = guild.default_role
+    locked = 0
+    for channel in guild.channels:
+        # Skip the channel we're in — that will be the verify channel
+        if channel == interaction.channel:
+            continue
+        if isinstance(channel, (discord.TextChannel, discord.VoiceChannel, discord.ForumChannel)):
+            try:
+                await channel.set_permissions(everyone, view_channel=False, send_messages=False)
+                await channel.set_permissions(member_role, view_channel=True, send_messages=True)
+                locked += 1
+            except Exception:
+                pass
+    steps.append(f"✅ Locked **{locked}** channels — only Members can see them")
+
+    # 4. Set verify channel visible to everyone but read-only
+    verify_channel = interaction.channel
+    try:
+        await verify_channel.set_permissions(everyone, view_channel=True, send_messages=False)
+        await verify_channel.set_permissions(member_role, view_channel=True, send_messages=False)
+        steps.append(f"✅ Set **#{verify_channel.name}** as public verify channel")
+    except Exception:
+        steps.append(f"⚠️ Could not update permissions on **#{verify_channel.name}**")
+
+    # 5. Send the verify embed
+    embed = discord.Embed(
+        title="🔒  Welcome to NATIVE",
+        description=(
+            "To get access to the server, click the button below.\n\n"
+            "You will instantly receive the **Member** role and unlock all channels."
+        ),
+        color=discord.Color.from_rgb(0, 185, 255)
+    )
+    embed.set_footer(text="NATIVE • Click once to verify")
+    await verify_channel.send(embed=embed, view=VerifyButton())
+    steps.append(f"✅ Sent verify message in **#{verify_channel.name}**")
+
+    # 6. Done
+    result = "\n".join(steps)
+    await interaction.followup.send(
+        f"**Verification setup complete!**\n\n{result}\n\n"
+        f"Make sure my role is **above** the Member role in Server Settings → Roles.",
+        ephemeral=True
+    )
 
 @bot.event
 async def on_member_join(member):
