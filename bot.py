@@ -97,7 +97,6 @@ intents.voice_states    = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
 warnings    = {}
-xp_data     = {}
 spam_track  = {}
 recent_join = []
 voice_track = {}
@@ -105,11 +104,6 @@ snipe_data  = {}
 
 BAD_WORDS = ["badword1", "badword2", "badword3"]
 
-def get_xp(guild_id, user_id):
-    return xp_data.setdefault(str(guild_id), {}).setdefault(str(user_id), {"xp": 0, "level": 1})
-
-def xp_for_level(level):
-    return int(100 * (1.4 ** (level - 1)))
 
 # ══════════════════════════════════════════════
 #  EVENTS
@@ -184,6 +178,63 @@ class VerifyButton(discord.ui.View):
             await interaction.response.send_message(
                 "❌ I don't have permission to assign that role.", ephemeral=True)
 
+
+
+# ── Perm Counter ──────────────────────────────────────────────────────────────
+perm_counter: dict = {}  # guild_id -> int
+
+def is_staff():
+    async def predicate(interaction: discord.Interaction):
+        staff_role = discord.utils.get(interaction.guild.roles, name="Staff")
+        if staff_role and staff_role in interaction.user.roles:
+            return True
+        if interaction.user.guild_permissions.administrator:
+            return True
+        await interaction.response.send_message("❌ You need the **Staff** role to use this.", ephemeral=True)
+        return False
+    return app_commands.check(predicate)
+
+@bot.tree.command(name="add", description="Add a number to the perm counter")
+@app_commands.describe(amount="Number to add")
+@is_staff()
+async def slash_add(interaction: discord.Interaction, amount: int):
+    gid = str(interaction.guild_id)
+    perm_counter[gid] = perm_counter.get(gid, 0) + amount
+    await interaction.response.send_message(
+        f"✅ Added **{amount}** — counter is now **{perm_counter[gid]}**.",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="remove", description="Remove a number from the perm counter")
+@app_commands.describe(amount="Number to remove")
+@is_staff()
+async def slash_remove(interaction: discord.Interaction, amount: int):
+    gid = str(interaction.guild_id)
+    perm_counter[gid] = perm_counter.get(gid, 0) - amount
+    await interaction.response.send_message(
+        f"✅ Removed **{amount}** — counter is now **{perm_counter[gid]}**.",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="show", description="Show the current perm counter")
+@is_staff()
+async def slash_show(interaction: discord.Interaction):
+    gid = str(interaction.guild_id)
+    total = perm_counter.get(gid, 0)
+    embed = discord.Embed(
+        title="🔢  Perm Counter",
+        description=f"**{total}**",
+        color=discord.Color.from_rgb(0, 185, 255)
+    )
+    embed.set_footer(text="NATIVE • Staff only")
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="resetcounter", description="Reset the perm counter to 0")
+@is_staff()
+async def slash_resetcounter(interaction: discord.Interaction):
+    gid = str(interaction.guild_id)
+    perm_counter[gid] = 0
+    await interaction.response.send_message("✅ Counter reset to **0**.", ephemeral=True)
 
 @bot.tree.command(name="sendverify", description="Send the verification message in this channel")
 @app_commands.checks.has_permissions(manage_guild=True)
@@ -411,51 +462,7 @@ async def on_message(message):
             except: pass
             await bot.process_commands(message)
             return
-    data   = get_xp(message.guild.id, member.id)
     gained = random.randint(1, 3)
-    data["xp"] += gained
-    needed = xp_for_level(data["level"])
-    if data["xp"] >= needed:
-        data["xp"] -= needed
-        data["level"] += 1
-        lvl_channel_id = guild_cfg.get("level_channel")
-        lvl_channel    = message.guild.get_channel(int(lvl_channel_id)) if lvl_channel_id else message.channel
-        try: await lvl_channel.send(f"🎉 {member.mention} leveled up to **Level {data['level']}**!")
-        except: pass
-    await bot.process_commands(message)
-
-@bot.event
-async def on_voice_state_update(member, before, after):
-    if member.bot: return
-    uid = member.id
-    now = datetime.datetime.utcnow()
-    if before.channel is None and after.channel is not None:
-        voice_track[uid] = now
-    elif before.channel is not None and after.channel is None:
-        if uid in voice_track:
-            joined_at = voice_track.pop(uid)
-            minutes   = (now - joined_at).total_seconds() / 60
-            if minutes >= 1 and member.guild:
-                earned    = max(1, int(minutes))
-                data      = get_xp(member.guild.id, member.id)
-                data["xp"] += earned
-                needed    = xp_for_level(data["level"])
-                guild_cfg = config.get(str(member.guild.id), {})
-                if data["xp"] >= needed:
-                    data["xp"] -= needed
-                    data["level"] += 1
-                    lvl_ch_id = guild_cfg.get("level_channel")
-                    if lvl_ch_id:
-                        lvl_ch = member.guild.get_channel(int(lvl_ch_id))
-                        if lvl_ch:
-                            try: await lvl_ch.send(f"🎉 {member.mention} leveled up to **Level {data['level']}** (voice)!")
-                            except: pass
-                log_ch_id = guild_cfg.get("voice_xp_log")
-                if log_ch_id:
-                    log_ch = member.guild.get_channel(int(log_ch_id))
-                    if log_ch:
-                        try: await log_ch.send(f"🎙️ **{member.display_name}** spent **{int(minutes)}m** in voice → **+{earned} XP**")
-                        except: pass
 
 # ══════════════════════════════════════════════
 #  TICKET SYSTEM
@@ -872,126 +879,6 @@ async def slash_setminaccountage(interaction: discord.Interaction, days: int):
     save_config(config)
     await interaction.response.send_message(f"✅ Minimum account age set to **{days} days**.")
 
-@bot.tree.command(name="level", description="Check level and XP")
-@app_commands.describe(member="Member to check")
-async def slash_level(interaction: discord.Interaction, member: discord.Member = None):
-    member     = member or interaction.user
-    data       = get_xp(interaction.guild.id, member.id)
-    needed     = xp_for_level(data["level"])
-    bar_filled = int((data["xp"] / needed) * 10)
-    bar        = "█" * bar_filled + "░" * (10 - bar_filled)
-    embed = discord.Embed(title=f"📈 Level — {member.display_name}", color=discord.Color.gold())
-    embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="Level",    value=f"**{data['level']}**",     inline=True)
-    embed.add_field(name="XP",       value=f"{data['xp']} / {needed}", inline=True)
-    embed.add_field(name="Progress", value=f"`{bar}`",                 inline=False)
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="leaderboard", description="Show XP leaderboard")
-async def slash_leaderboard(interaction: discord.Interaction):
-    guild_xp = xp_data.get(str(interaction.guild.id), {})
-    if not guild_xp:
-        return await interaction.response.send_message("❌ No XP data yet!")
-    sorted_users = sorted(guild_xp.items(), key=lambda x: (x[1]["level"], x[1]["xp"]), reverse=True)[:10]
-    embed  = discord.Embed(title=f"🏆 XP Leaderboard — {interaction.guild.name}", color=discord.Color.gold())
-    medals = ["🥇","🥈","🥉"]
-    for i, (uid, d) in enumerate(sorted_users):
-        medal = medals[i] if i < 3 else f"**{i+1}.**"
-        m     = interaction.guild.get_member(int(uid))
-        name  = m.display_name if m else f"User {uid}"
-        embed.add_field(name=f"{medal} {name}", value=f"Level {d['level']} • {d['xp']} XP", inline=False)
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="setlevelchannel", description="Set level-up message channel")
-@app_commands.describe(channel="Channel")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_setlevelchannel(interaction: discord.Interaction, channel: discord.TextChannel):
-    guild_cfg = config.setdefault(str(interaction.guild.id), {})
-    guild_cfg["level_channel"] = str(channel.id)
-    save_config(config)
-    await interaction.response.send_message(f"✅ Level-up messages → {channel.mention}.")
-
-@bot.tree.command(name="resetxp", description="Reset XP for a member")
-@app_commands.describe(member="Member")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_resetxp(interaction: discord.Interaction, member: discord.Member):
-    xp_data.get(str(interaction.guild.id), {}).pop(str(member.id), None)
-    await interaction.response.send_message(f"✅ Reset XP for **{member.display_name}**.")
-
-@bot.tree.command(name="slots", description="Play the slot machine!")
-@app_commands.describe(bet="How many coins to bet (min 10)")
-async def slash_slots(interaction: discord.Interaction, bet: int = 10):
-    if bet < 10:
-        return await interaction.response.send_message("❌ Minimum bet is **10 coins**!", ephemeral=True)
-    coins_store = xp_data.setdefault("coins", {})
-    uid = str(interaction.user.id)
-    coins_store.setdefault(uid, 100)
-    if coins_store[uid] < bet:
-        return await interaction.response.send_message(f"❌ You only have **🪙 {coins_store[uid]} coins**!", ephemeral=True)
-    slots   = ["🍒","🍋","🍊","🍇","⭐","💎","7️⃣"]
-    weights = [30,25,20,15,5,3,2]
-    reel1 = random.choices(slots, weights=weights)[0]
-    reel2 = random.choices(slots, weights=weights)[0]
-    reel3 = random.choices(slots, weights=weights)[0]
-    display = f"┃ {reel1} ┃ {reel2} ┃ {reel3} ┃"
-    multipliers = {"💎":50,"7️⃣":25,"⭐":10,"🍇":5,"🍊":4,"🍋":3,"🍒":2}
-    coins_store[uid] -= bet
-    if reel1 == reel2 == reel3:
-        mult = multipliers.get(reel1, 2); winnings = bet * mult
-        coins_store[uid] += winnings
-        result = f"🎉 **JACKPOT! {reel1}{reel1}{reel1}** — Won **🪙 {winnings}** (x{mult})!"; color = discord.Color.gold()
-    elif reel1 == reel2 or reel2 == reel3:
-        winnings = bet * 2; coins_store[uid] += winnings
-        result = f"✨ **Two of a kind!** — Won **🪙 {winnings}** (x2)!"; color = discord.Color.green()
-    elif "🍒" in (reel1,reel2,reel3):
-        winnings = int(bet*0.5); coins_store[uid] += winnings
-        result = f"🍒 **Cherry!** — Got back **🪙 {winnings}**."; color = discord.Color.orange()
-    else:
-        result = f"😔 **No match!** — Lost **🪙 {bet}**."; color = discord.Color.red()
-    embed = discord.Embed(title="🎰 Slot Machine", color=color)
-    embed.add_field(name="Reels",   value=f"```{display}```", inline=False)
-    embed.add_field(name="Result",  value=result,             inline=False)
-    embed.add_field(name="Balance", value=f"🪙 {coins_store[uid]} coins", inline=False)
-    embed.set_footer(text="💎=x50 | 7️⃣=x25 | ⭐=x10 | 🍇=x5 | 🍊=x4 | 🍋=x3 | 🍒=x2")
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="coinbalance", description="Check your coin balance")
-async def slash_coinbalance(interaction: discord.Interaction):
-    coins_store = xp_data.setdefault("coins", {})
-    uid = str(interaction.user.id)
-    coins_store.setdefault(uid, 100)
-    await interaction.response.send_message(f"You have **{coins_store[uid]} coins**!")
-
-@bot.tree.command(name="givecoin", description="Give coins to another member")
-@app_commands.describe(member="Who to give to", amount="How many coins")
-async def slash_givecoin(interaction: discord.Interaction, member: discord.Member, amount: int):
-    if amount <= 0:
-        return await interaction.response.send_message("❌ Amount must be positive!", ephemeral=True)
-    coins_store = xp_data.setdefault("coins", {})
-    giver = str(interaction.user.id); receiver = str(member.id)
-    coins_store.setdefault(giver, 100); coins_store.setdefault(receiver, 100)
-    if coins_store[giver] < amount:
-        return await interaction.response.send_message(f"❌ You only have **🪙 {coins_store[giver]}**!", ephemeral=True)
-    coins_store[giver] -= amount; coins_store[receiver] += amount
-    await interaction.response.send_message(f"✅ Gave **🪙 {amount}** to {member.mention}!")
-
-@bot.tree.command(name="daily", description="Claim your daily coins")
-async def slash_daily(interaction: discord.Interaction):
-    coins_store = xp_data.setdefault("coins", {})
-    daily_store = xp_data.setdefault("daily", {})
-    uid  = str(interaction.user.id)
-    coins_store.setdefault(uid, 100)
-    now  = datetime.datetime.utcnow()
-    last = daily_store.get(uid)
-    if last:
-        diff = (now - datetime.datetime.fromisoformat(last)).total_seconds()
-        if diff < 86400:
-            h = int((86400-diff)//3600); m = int(((86400-diff)%3600)//60)
-            return await interaction.response.send_message(f"⏰ Come back in **{h}h {m}m**!", ephemeral=True)
-    reward = random.randint(50, 200)
-    coins_store[uid] += reward; daily_store[uid] = now.isoformat()
-    await interaction.response.send_message(f"✅ Claimed **🪙 {reward} daily coins**! Balance: {coins_store[uid]}")
-
 @bot.tree.command(name="setupstats", description="Create auto-updating server stat channels")
 @app_commands.checks.has_permissions(administrator=True)
 async def slash_setupstats(interaction: discord.Interaction):
@@ -1020,32 +907,6 @@ async def slash_removestats(interaction: discord.Interaction):
     guild_cfg.pop("stats_channels", None)
     save_config(config)
     await interaction.response.send_message("✅ Stats channels removed.")
-
-@bot.tree.command(name="setvoicexplog", description="Set voice XP log channel")
-@app_commands.describe(channel="Log channel")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_setvoicexplog(interaction: discord.Interaction, channel: discord.TextChannel):
-    guild_cfg = config.setdefault(str(interaction.guild.id), {})
-    guild_cfg["voice_xp_log"] = str(channel.id)
-    save_config(config)
-    await interaction.response.send_message(f"✅ Voice XP logs → {channel.mention}.")
-
-@bot.tree.command(name="voicexp", description="Check voice XP")
-async def slash_voicexp(interaction: discord.Interaction):
-    uid = interaction.user.id
-    if uid in voice_track:
-        minutes   = (datetime.datetime.utcnow() - voice_track[uid]).total_seconds() / 60
-        potential = max(1, int(minutes))
-        embed = discord.Embed(title="🎙️ Voice XP", color=discord.Color.purple())
-        embed.add_field(name="In voice",     value=f"**{int(minutes)} minutes**", inline=True)
-        embed.add_field(name="XP on leaving",value=f"**+{potential} XP**",        inline=True)
-        await interaction.response.send_message(embed=embed)
-    else:
-        data  = get_xp(interaction.guild.id, uid)
-        embed = discord.Embed(title="🎙️ Voice XP", color=discord.Color.purple(), description="Not in a voice channel.")
-        embed.add_field(name="Level", value=data["level"], inline=True)
-        embed.add_field(name="XP",    value=data["xp"],    inline=True)
-        await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="whoinvoice", description="See who is in voice channels")
 async def slash_whoinvoice(interaction: discord.Interaction):
