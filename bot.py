@@ -216,12 +216,13 @@ async def setverifyrole(interaction: discord.Interaction, role: discord.Role):
         f"✅ Verify role set to **{role.name}**.", ephemeral=True)
 
 
-@bot.tree.command(name="setupverify", description="Fully sets up verification — creates role, locks channels, sends verify message")
+@bot.tree.command(name="setupverify", description="Transfers @everyone channel permissions to Member role and sends verify message")
 @app_commands.checks.has_permissions(administrator=True)
 async def setupverify(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    guild = interaction.guild
-    steps = []
+    guild   = interaction.guild
+    everyone = guild.default_role
+    steps   = []
 
     # 1. Create or find Member role
     member_role = discord.utils.get(guild.roles, name="Member")
@@ -235,36 +236,45 @@ async def setupverify(interaction: discord.Interaction):
     else:
         steps.append("✅ Found existing **Member** role")
 
-    # 2. Save the role in config
     set_setting(guild.id, "verify_role", str(member_role.id))
-    steps.append("✅ Saved verify role to config")
 
-    # 3. Lock all channels — deny @everyone, allow Member role
-    everyone = guild.default_role
-    locked = 0
+    # 2. For every channel, copy @everyone overwrites to Member then deny @everyone
+    transferred = 0
     for channel in guild.channels:
-        # Skip the channel we're in — that will be the verify channel
         if channel == interaction.channel:
             continue
-        if isinstance(channel, (discord.TextChannel, discord.VoiceChannel, discord.ForumChannel)):
-            try:
-                await channel.set_permissions(everyone, view_channel=False, send_messages=False)
-                await channel.set_permissions(member_role, view_channel=True, send_messages=True)
-                locked += 1
-            except Exception:
-                pass
-    steps.append(f"✅ Locked **{locked}** channels — only Members can see them")
+        if not isinstance(channel, (discord.TextChannel, discord.VoiceChannel,
+                                     discord.StageChannel, discord.ForumChannel)):
+            continue
+        try:
+            everyone_ow = channel.overwrites_for(everyone)
+            # Copy all @everyone permissions to Member role
+            member_ow = discord.PermissionOverwrite()
+            for perm, value in everyone_ow:
+                if value is not None:
+                    setattr(member_ow, perm, value)
+            # If member_ow has nothing (neutral channel), grant basic access
+            if not any(v is not None for _, v in member_ow):
+                member_ow = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+            # Deny @everyone view
+            new_everyone = discord.PermissionOverwrite(view_channel=False)
+            await channel.set_permissions(member_role, overwrite=member_ow)
+            await channel.set_permissions(everyone, overwrite=new_everyone)
+            transferred += 1
+        except Exception:
+            pass
+    steps.append(f"✅ Transferred permissions on **{transferred}** channels to **Member** role")
 
-    # 4. Set verify channel visible to everyone but read-only
+    # 3. Set verify channel — everyone can see but not type, member same
     verify_channel = interaction.channel
     try:
-        await verify_channel.set_permissions(everyone, view_channel=True, send_messages=False)
-        await verify_channel.set_permissions(member_role, view_channel=True, send_messages=False)
+        await verify_channel.set_permissions(everyone,     view_channel=True, send_messages=False)
+        await verify_channel.set_permissions(member_role,  view_channel=True, send_messages=False)
         steps.append(f"✅ Set **#{verify_channel.name}** as public verify channel")
     except Exception:
-        steps.append(f"⚠️ Could not update permissions on **#{verify_channel.name}**")
+        steps.append(f"⚠️ Could not update **#{verify_channel.name}**")
 
-    # 5. Send the verify embed
+    # 4. Send verify embed
     embed = discord.Embed(
         title="🔒  Welcome to NATIVE",
         description=(
@@ -277,11 +287,10 @@ async def setupverify(interaction: discord.Interaction):
     await verify_channel.send(embed=embed, view=VerifyButton())
     steps.append(f"✅ Sent verify message in **#{verify_channel.name}**")
 
-    # 6. Done
     result = "\n".join(steps)
     await interaction.followup.send(
         f"**Verification setup complete!**\n\n{result}\n\n"
-        f"Make sure my role is **above** the Member role in Server Settings → Roles.",
+        f"⚠️ Make sure the bot role is **above** Member in Server Settings → Roles.",
         ephemeral=True
     )
 
