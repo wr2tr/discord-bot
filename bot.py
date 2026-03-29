@@ -267,15 +267,13 @@ async def setverifyrole(interaction: discord.Interaction, role: discord.Role):
         f"✅ Verify role set to **{role.name}**.", ephemeral=True)
 
 
-@bot.tree.command(name="setupverify", description="Transfers @everyone channel permissions to Member role and sends verify message")
+@bot.tree.command(name="setupverify", description="Create Member role and send verify message — does NOT change any channel permissions")
 @app_commands.checks.has_permissions(administrator=True)
 async def setupverify(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    guild   = interaction.guild
-    everyone = guild.default_role
-    steps   = []
+    guild = interaction.guild
 
-    # 1. Create or find Member role
+    # Create or find Member role
     member_role = discord.utils.get(guild.roles, name="Member")
     if not member_role:
         member_role = await guild.create_role(
@@ -283,64 +281,26 @@ async def setupverify(interaction: discord.Interaction):
             color=discord.Color.from_rgb(0, 185, 255),
             reason="NATIVE verify setup"
         )
-        steps.append("✅ Created **Member** role")
+        role_msg = "✅ Created **Member** role"
     else:
-        steps.append("✅ Found existing **Member** role")
+        role_msg = "✅ Found existing **Member** role"
 
     set_setting(guild.id, "verify_role", str(member_role.id))
 
-    # 2. For every channel, copy @everyone overwrites to Member then deny @everyone
-    transferred = 0
-    for channel in guild.channels:
-        if channel == interaction.channel:
-            continue
-        if not isinstance(channel, (discord.TextChannel, discord.VoiceChannel,
-                                     discord.StageChannel, discord.ForumChannel)):
-            continue
-        try:
-            everyone_ow = channel.overwrites_for(everyone)
-            # Copy all @everyone permissions to Member role
-            member_ow = discord.PermissionOverwrite()
-            for perm, value in everyone_ow:
-                if value is not None:
-                    setattr(member_ow, perm, value)
-            # If member_ow has nothing (neutral channel), grant basic access
-            if not any(v is not None for _, v in member_ow):
-                member_ow = discord.PermissionOverwrite(view_channel=True, send_messages=True)
-            # Deny @everyone view
-            new_everyone = discord.PermissionOverwrite(view_channel=False)
-            await channel.set_permissions(member_role, overwrite=member_ow)
-            await channel.set_permissions(everyone, overwrite=new_everyone)
-            transferred += 1
-        except Exception:
-            pass
-    steps.append(f"✅ Transferred permissions on **{transferred}** channels to **Member** role")
-
-    # 3. Set verify channel — everyone can see but not type, member same
-    verify_channel = interaction.channel
-    try:
-        await verify_channel.set_permissions(everyone,     view_channel=True, send_messages=False)
-        await verify_channel.set_permissions(member_role,  view_channel=True, send_messages=False)
-        steps.append(f"✅ Set **#{verify_channel.name}** as public verify channel")
-    except Exception:
-        steps.append(f"⚠️ Could not update **#{verify_channel.name}**")
-
-    # 4. Send verify embed
+    # Send verify embed — no channel permission changes at all
     embed = discord.Embed(
         title="🔒  Welcome to NATIVE",
         description=(
             "To get access to the server, click the button below.\n\n"
-            "You will instantly receive the **Member** role and unlock all channels."
+            "You will instantly receive the **Member** role."
         ),
         color=discord.Color.from_rgb(0, 185, 255)
     )
     embed.set_footer(text="NATIVE • Click once to verify")
-    await verify_channel.send(embed=embed, view=VerifyButton())
-    steps.append(f"✅ Sent verify message in **#{verify_channel.name}**")
+    await interaction.channel.send(embed=embed, view=VerifyButton())
 
-    result = "\n".join(steps)
     await interaction.followup.send(
-        f"**Verification setup complete!**\n\n{result}\n\n"
+        f"{role_msg}\n✅ Verify role saved\n✅ Verify message sent in this channel\n\n"
         f"⚠️ Make sure the bot role is **above** Member in Server Settings → Roles.",
         ephemeral=True
     )
@@ -594,6 +554,23 @@ async def slash_key(interaction: discord.Interaction, machine_id: str, duration:
             except: pass
 
 # ── TICKET SETUP ──────────────────────────────
+
+@bot.tree.command(name="close", description="Close the current ticket channel")
+async def slash_close(interaction: discord.Interaction):
+    channel = interaction.channel
+    # Check it's a ticket channel
+    if not (channel.topic and channel.topic.startswith("ticket-owner-")):
+        return await interaction.response.send_message(
+            "❌ This is not a ticket channel.", ephemeral=True)
+    owner_id = int(channel.topic.replace("ticket-owner-", ""))
+    is_owner = interaction.user.id == owner_id
+    is_staff = interaction.user.guild_permissions.administrator or                discord.utils.get(interaction.guild.roles, name="Staff") in interaction.user.roles
+    if not (is_owner or is_staff):
+        return await interaction.response.send_message(
+            "❌ Only the ticket owner or Staff can close this.", ephemeral=True)
+    await interaction.response.send_message("🔒 Closing ticket...")
+    await channel.delete(reason=f"Ticket closed by {interaction.user}")
+
 @bot.tree.command(name="ticketsetup", description="Set up the ticket panel")
 @app_commands.describe(channel="Channel for the panel", title="Panel title", description="Panel description")
 @app_commands.checks.has_permissions(administrator=True)
@@ -795,12 +772,7 @@ async def slash_snipe(interaction: discord.Interaction):
 @bot.tree.command(name="8ball", description="Ask the magic 8ball")
 @app_commands.describe(question="Your question")
 async def slash_8ball(interaction: discord.Interaction, question: str):
-    responses = ["It is certain.","It is decidedly so.","Without a doubt.","Yes definitely.",
-        "You may rely on it.","As I see it, yes.","Most likely.","Outlook good.","Yes.",
-        "Signs point to yes.","Reply hazy, try again.","Ask again later.",
-        "Better not tell you now.","Cannot predict now.","Concentrate and ask again.",
-        "Don't count on it.","My reply is no.","My sources say no.",
-        "Outlook not so good.","Very doubtful."]
+    responses = ["Yes.", "No."]
     embed = discord.Embed(title="🎱 Magic 8-Ball", color=discord.Color.dark_purple())
     embed.add_field(name="Question", value=question,               inline=False)
     embed.add_field(name="Answer",   value=random.choice(responses), inline=False)
