@@ -194,6 +194,58 @@ def is_staff():
         return False
     return app_commands.check(predicate)
 
+
+# ── Machine ID Ban System ─────────────────────────────────────────────────────
+banned_hwids: set = set()
+
+def load_bans():
+    try:
+        with open("banned_hwids.txt") as f:
+            return set(l.strip().upper() for l in f if l.strip())
+    except: return set()
+
+def save_bans():
+    with open("banned_hwids.txt", "w") as f:
+        f.write("\n".join(sorted(banned_hwids)))
+
+banned_hwids = load_bans()
+
+@bot.tree.command(name="banmachineid", description="Ban a machine ID so the key is rejected and user is kicked out")
+@app_commands.describe(machine_id="The 16-character machine ID to ban")
+@is_staff()
+async def slash_banmachineid(interaction: discord.Interaction, machine_id: str):
+    hwid = machine_id.strip().upper()
+    if len(hwid) != 16:
+        return await interaction.response.send_message(
+            "❌ Machine ID must be exactly 16 hex characters.", ephemeral=True)
+    banned_hwids.add(hwid)
+    save_bans()
+    await interaction.response.send_message(
+        f"✅ Machine ID `{hwid}` has been banned. Their license will be rejected on next launch.",
+        ephemeral=True)
+
+@bot.tree.command(name="unbanmachineid", description="Unban a machine ID")
+@app_commands.describe(machine_id="The machine ID to unban")
+@is_staff()
+async def slash_unbanmachineid(interaction: discord.Interaction, machine_id: str):
+    hwid = machine_id.strip().upper()
+    if hwid in banned_hwids:
+        banned_hwids.discard(hwid)
+        save_bans()
+        await interaction.response.send_message(f"✅ Machine ID `{hwid}` unbanned.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"❌ `{hwid}` was not banned.", ephemeral=True)
+
+@bot.tree.command(name="listbans", description="List all banned machine IDs")
+@is_staff()
+async def slash_listbans(interaction: discord.Interaction):
+    if not banned_hwids:
+        return await interaction.response.send_message("No banned machine IDs.", ephemeral=True)
+    embed = discord.Embed(title="🔨 Banned Machine IDs",
+        color=discord.Color.red())
+    embed.description = "\n".join(f"`{h}`" for h in sorted(banned_hwids))
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 @bot.tree.command(name="add", description="Add a number to the perm counter")
 @app_commands.describe(amount="Number to add")
 @is_staff()
