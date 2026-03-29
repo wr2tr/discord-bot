@@ -311,12 +311,6 @@ async def on_member_join(member):
                 return
             except: pass
     guild_cfg   = config.get(str(member.guild.id), {})
-    autorole_id = os.getenv("AUTOROLE_ID") or guild_cfg.get("autorole")
-    if autorole_id:
-        role = member.guild.get_role(int(autorole_id))
-        if role:
-            try: await member.add_roles(role, reason="Auto-role on join")
-            except Exception as e: print(f"Autorole error: {e}")
     welcome_channel_id = os.getenv("WELCOME_CHANNEL_ID") or guild_cfg.get("welcome_channel")
     welcome_message    = os.getenv("WELCOME_MESSAGE")    or guild_cfg.get("welcome_message", "Welcome {mention}!")
     if welcome_channel_id:
@@ -716,16 +710,6 @@ async def slash_removerole(interaction: discord.Interaction, member: discord.Mem
     await member.remove_roles(role)
     await interaction.response.send_message(f"✅ Removed **{role.name}** from **{member.display_name}**.")
 
-@bot.tree.command(name="setautorole", description="Auto-give a role to new members")
-@app_commands.describe(role="Role to auto-give")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_setautorole(interaction: discord.Interaction, role: discord.Role):
-    set_setting(interaction.guild.id, "autorole", str(role.id))
-    embed = discord.Embed(title="✅ Auto-Role Set!", color=discord.Color.green())
-    embed.add_field(name="Role", value=role.mention, inline=True)
-    embed.add_field(name="⚠️ Survive restarts", value=f"Railway → Variables → `AUTOROLE_ID` = `{role.id}`", inline=False)
-    await interaction.response.send_message(embed=embed)
-
 @bot.tree.command(name="setwelcome", description="Set welcome channel and message")
 @app_commands.describe(channel="Channel", message="Message ({mention} {name} {server})")
 @app_commands.checks.has_permissions(administrator=True)
@@ -1082,7 +1066,7 @@ async def slash_help(interaction: discord.Interaction):
     embed.add_field(name="🎫 Tickets",    value="`/ticketsetup`",                                                                                                                    inline=False)
     embed.add_field(name="🔨 Moderation", value="`/kick` `/ban` `/unban` `/mute` `/unmute` `/warn` `/warnings` `/clearwarnings` `/purge` `/slowmode` `/lock` `/unlock` `/nick`",    inline=False)
     embed.add_field(name="🏷️ Roles",      value="`/addrole` `/removerole`",                                                                                                         inline=False)
-    embed.add_field(name="⚙️ Setup",      value="`/setautorole` `/setwelcome` `/setleave`",                                                                                         inline=False)
+    embed.add_field(name="⚙️ Setup",      value="`/setwelcome` `/setleave`",                                                                                         inline=False)
     embed.add_field(name="🛡️ Auto-Mod",   value="`/automod` `/automodstatus` `/addbadword` `/removebadword` `/setminaccountage` `/setlogchannel`",                                  inline=False)
     embed.add_field(name="📈 Leveling",   value="`/level` `/leaderboard` `/setlevelchannel` `/resetxp`",                                                                            inline=False)
     embed.add_field(name="🎙️ Voice XP",   value="`/voicexp` `/whoinvoice` `/setvoicexplog`",                                                                                        inline=False)
