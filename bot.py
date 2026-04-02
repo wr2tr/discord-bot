@@ -745,6 +745,168 @@ async def slash_8ball(interaction: discord.Interaction, question: str):
     await interaction.response.send_message(embed=embed)
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ID STORE — link Discord users to Machine IDs
+# ══════════════════════════════════════════════════════════════════════════════
+# id_store: { discord_user_id: [hwid1, hwid2, ...] }
+id_store: dict = {}
+
+def load_id_store():
+    try:
+        with open("id_store.json") as f:
+            return json.load(f)
+    except: return {}
+
+def save_id_store():
+    with open("id_store.json", "w") as f:
+        json.dump(id_store, f, indent=2)
+
+id_store = load_id_store()
+
+@bot.tree.command(name="addid", description="Link a Machine ID to a Discord user")
+@app_commands.describe(user="Discord user", machine_id="Their 16-character Machine ID")
+@is_staff()
+async def slash_addid(interaction: discord.Interaction, user: discord.Member, machine_id: str):
+    hwid = machine_id.strip().upper().replace("-","").replace(" ","")
+    if len(hwid) != 16 or not all(c in "0123456789ABCDEF" for c in hwid):
+        return await interaction.response.send_message("❌ Must be 16 hex characters.", ephemeral=True)
+    uid = str(user.id)
+    ids = id_store.setdefault(uid, [])
+    if hwid in ids:
+        return await interaction.response.send_message(f"❌ `{hwid}` is already linked to {user.mention}.", ephemeral=True)
+    ids.append(hwid)
+    save_id_store()
+    embed = discord.Embed(title="✅ ID Linked", color=discord.Color.from_rgb(0,185,255))
+    embed.add_field(name="User", value=user.mention, inline=True)
+    embed.add_field(name="Machine ID", value=f"`{hwid}`", inline=True)
+    embed.set_footer(text=f"Total IDs for this user: {len(ids)}")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="removeid", description="Unlink a Machine ID from a Discord user")
+@app_commands.describe(user="Discord user", machine_id="Machine ID to remove")
+@is_staff()
+async def slash_removeid(interaction: discord.Interaction, user: discord.Member, machine_id: str):
+    hwid = machine_id.strip().upper().replace("-","").replace(" ","")
+    uid = str(user.id)
+    ids = id_store.get(uid, [])
+    if hwid not in ids:
+        return await interaction.response.send_message(f"❌ `{hwid}` is not linked to {user.mention}.", ephemeral=True)
+    ids.remove(hwid)
+    save_id_store()
+    await interaction.response.send_message(f"✅ Removed `{hwid}` from {user.mention}.", ephemeral=True)
+
+@bot.tree.command(name="checkid", description="Check Machine IDs linked to a user")
+@app_commands.describe(user="Discord user to check")
+@is_staff()
+async def slash_checkid(interaction: discord.Interaction, user: discord.Member):
+    uid = str(user.id)
+    ids = id_store.get(uid, [])
+    embed = discord.Embed(
+        title=f"🔍 Machine IDs — {user.display_name}",
+        color=discord.Color.from_rgb(0,185,255)
+    )
+    embed.set_thumbnail(url=user.display_avatar.url)
+    if not ids:
+        embed.description = "No Machine IDs linked to this user."
+    else:
+        for hwid in ids:
+            is_banned = hwid in banned_hwids
+            status = "🔨 BANNED" if is_banned else "✅ Active"
+            embed.add_field(name=f"`{hwid}`", value=status, inline=False)
+    embed.set_footer(text=f"{len(ids)} ID(s) linked")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="whois", description="Find which Discord user owns a Machine ID")
+@app_commands.describe(machine_id="16-character Machine ID to look up")
+@is_staff()
+async def slash_whois(interaction: discord.Interaction, machine_id: str):
+    hwid = machine_id.strip().upper().replace("-","").replace(" ","")
+    found = []
+    for uid, ids in id_store.items():
+        if hwid in ids:
+            member = interaction.guild.get_member(int(uid))
+            found.append(member.mention if member else f"User `{uid}` (left server)")
+    if not found:
+        return await interaction.response.send_message(f"❌ `{hwid}` is not linked to any user.", ephemeral=True)
+    is_banned = hwid in banned_hwids
+    embed = discord.Embed(title="🔍 Machine ID Lookup", color=discord.Color.from_rgb(0,185,255))
+    embed.add_field(name="Machine ID", value=f"`{hwid}`", inline=False)
+    embed.add_field(name="Owner(s)", value="\n".join(found), inline=False)
+    embed.add_field(name="Status", value="🔨 BANNED" if is_banned else "✅ Active", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  REVOKE KEY — bans machine ID so macro kicks user out within 10s
+# ══════════════════════════════════════════════════════════════════════════════
+@bot.tree.command(name="revokekey", description="Revoke a user's license — bans their machine ID instantly")
+@app_commands.describe(machine_id="Machine ID to revoke (or use user to revoke all their IDs)")
+@is_staff()
+async def slash_revokekey(interaction: discord.Interaction, machine_id: str = None, user: discord.Member = None):
+    if not machine_id and not user:
+        return await interaction.response.send_message("❌ Provide a machine_id or user.", ephemeral=True)
+    
+    revoked = []
+    
+    if machine_id:
+        hwid = machine_id.strip().upper().replace("-","").replace(" ","")
+        if len(hwid) != 16:
+            return await interaction.response.send_message("❌ Must be 16 hex characters.", ephemeral=True)
+        banned_hwids.add(hwid)
+        revoked.append(hwid)
+    
+    if user:
+        uid = str(user.id)
+        for hwid in id_store.get(uid, []):
+            banned_hwids.add(hwid)
+            revoked.append(hwid)
+    
+    if not revoked:
+        return await interaction.response.send_message("❌ No IDs to revoke.", ephemeral=True)
+    
+    save_bans()
+    
+    embed = discord.Embed(
+        title="🔨 License Revoked",
+        color=discord.Color.red()
+    )
+    embed.description = "\n".join(f"`{h}`" for h in revoked)
+    if user:
+        embed.add_field(name="User", value=user.mention, inline=True)
+    embed.add_field(name="Status", value="Macro will kick them within **10 seconds**", inline=False)
+    embed.set_footer(text="NATIVE • License revoked")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="restorekey", description="Restore a revoked license (unban machine ID)")
+@app_commands.describe(machine_id="Machine ID to restore")
+@is_staff()
+async def slash_restorekey(interaction: discord.Interaction, machine_id: str = None, user: discord.Member = None):
+    if not machine_id and not user:
+        return await interaction.response.send_message("❌ Provide a machine_id or user.", ephemeral=True)
+    
+    restored = []
+    
+    if machine_id:
+        hwid = machine_id.strip().upper().replace("-","").replace(" ","")
+        if hwid in banned_hwids:
+            banned_hwids.discard(hwid)
+            restored.append(hwid)
+    
+    if user:
+        uid = str(user.id)
+        for hwid in id_store.get(uid, []):
+            if hwid in banned_hwids:
+                banned_hwids.discard(hwid)
+                restored.append(hwid)
+    
+    if not restored:
+        return await interaction.response.send_message("❌ No banned IDs found to restore.", ephemeral=True)
+    
+    save_bans()
+    embed = discord.Embed(title="✅ License Restored", color=discord.Color.green())
+    embed.description = "\n".join(f"`{h}`" for h in restored)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  POLL SYSTEM
 # ══════════════════════════════════════════════════════════════════════════════
