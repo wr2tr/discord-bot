@@ -1,1259 +1,662 @@
-import discord
-from discord.ext import commands, tasks
-from discord import app_commands
-import json, os, random, re, datetime, asyncio
-from datetime import timedelta
-from aiohttp import web
+#![windows_subsystem = "windows"]
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  CONFIG
-# ══════════════════════════════════════════════════════════════════════════════
-TOKEN         = os.getenv("TOKEN")
-NATIVE_SECRET = 0xA3F7_C291_5E6B_D840
-OWNER_ID      = 1096099089076203530
-CONFIG_FILE   = "config.json"
+use eframe::egui;
+use eframe::egui::{
+    Color32, ColorImage, FontFamily, FontId, Pos2, Rect,
+    RichText, Rounding, Sense, Stroke, TextureHandle, Vec2,
+};
+use rdev::{listen, Event, EventType, Key};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
-def load_config():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE) as f: return json.load(f)
-    return {}
+#[cfg(windows)]
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtSetTimerResolution(desired: u32, set: u8, current: *mut u32) -> i32;
+    fn NtDelayExecution(alertable: u8, interval: *const i64) -> i32;
+}
+#[cfg(windows)]
+extern crate winapi;
 
-def save_config(data):
-    with open(CONFIG_FILE, "w") as f: json.dump(data, f, indent=2)
+#[cfg(windows)]
+#[link(name = "avrt")]
+extern "system" {
+    fn AvSetMmThreadCharacteristicsA(task_name: *const i8, task_index: *mut u32) -> winapi::um::winnt::HANDLE;
+    #[allow(dead_code)]
+    #[allow(dead_code)]
+    fn AvRevertMmThreadCharacteristics(avrt_handle: winapi::um::winnt::HANDLE) -> i32;
+}
 
-config = load_config()
-
-def get_setting(guild_id, key):
-    return config.get(str(guild_id), {}).get(key)
-
-def set_setting(guild_id, key, value):
-    config.setdefault(str(guild_id), {})[key] = value
-    save_config(config)
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  KEY SYSTEM
-# ══════════════════════════════════════════════════════════════════════════════
-def fnv64(data: bytes) -> int:
-    h, prime, mask = 0xcbf29ce484222325, 0x00000001000000b3, 0xFFFFFFFFFFFFFFFF
-    for b in data: h = ((h ^ b) * prime) & mask
-    return h
-
-def derive_key(hw_id: int) -> str:
-    mask = 0xFFFFFFFFFFFFFFFF
-    def xb(n): return (n & mask).to_bytes(8, "little")
-    a = fnv64(xb(hw_id ^ NATIVE_SECRET))
-    b = fnv64(xb(hw_id ^ NATIVE_SECRET ^ 0x1234567890abcdef))
-    c = fnv64(xb(hw_id ^ NATIVE_SECRET ^ 0xfedcba9876543210))
-    return (f"NTVE-{(a>>48)&0xFFFF:04X}-{(a>>32)&0xFFFF:04X}"
-            f"-{(b>>48)&0xFFFF:04X}-{(b>>32)&0xFFFF:04X}"
-            f"-{(c>>48)&0xFFFF:04X}")
-
-def parse_duration(s: str):
-    if not s or s.lower() in ("permanent","perm","forever","0"): return None
-    m = re.fullmatch(r"(\d+)(m|h|d)", s.lower().strip())
-    if not m: return None
-    return int(m.group(1)) * {"m":60,"h":3600,"d":86400}[m.group(2)]
-
-def fmt_duration(secs: int) -> str:
-    if secs < 3600: return f"{secs//60} minutes"
-    if secs < 86400:
-        h = secs//3600; m = (secs%3600)//60
-        return f"{h}h {m}m" if m else f"{h} hours"
-    d = secs//86400; h = (secs%86400)//3600
-    return f"{d}d {h}h" if h else f"{d} days"
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  BAN SYSTEM
-# ══════════════════════════════════════════════════════════════════════════════
-banned_hwids: set = set()
-
-def load_bans():
-    try:
-        with open("banned_hwids.txt") as f:
-            return set(l.strip().upper() for l in f if l.strip())
-    except: return set()
-
-def save_bans():
-    with open("banned_hwids.txt", "w") as f:
-        f.write("\n".join(sorted(banned_hwids)))
-
-banned_hwids = load_bans()
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  BOT SETUP
-# ══════════════════════════════════════════════════════════════════════════════
-intents = discord.Intents.default()
-intents.members         = True
-intents.message_content = True
-intents.voice_states    = True
-
-bot          = commands.Bot(command_prefix="!", intents=intents)
-warnings     = {}
-spam_track   = {}
-recent_join  = []
-snipe_data   = {}
-perm_counter = {}
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  STAFF CHECK
-# ══════════════════════════════════════════════════════════════════════════════
-def is_staff():
-    async def predicate(interaction: discord.Interaction):
-        if interaction.user.guild_permissions.administrator: return True
-        role = discord.utils.get(interaction.guild.roles, name="Staff")
-        if role and role in interaction.user.roles: return True
-        await interaction.response.send_message("❌ You need the **Staff** role.", ephemeral=True)
-        return False
-    return app_commands.check(predicate)
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  VIEWS
-# ══════════════════════════════════════════════════════════════════════════════
-class VerifyButton(discord.ui.View):
-    def __init__(self): super().__init__(timeout=None)
-
-    @discord.ui.button(label="✅  Verify", style=discord.ButtonStyle.green, custom_id="verify_button")
-    async def verify(self, interaction: discord.Interaction, button: discord.ui.Button):
-        role_id = get_setting(interaction.guild_id, "verify_role")
-        if not role_id:
-            return await interaction.response.send_message("❌ Verify role not set. Run /setverifyrole.", ephemeral=True)
-        role = interaction.guild.get_role(int(role_id))
-        if not role:
-            return await interaction.response.send_message("❌ Role not found.", ephemeral=True)
-        if role in interaction.user.roles:
-            return await interaction.response.send_message("✅ Already verified!", ephemeral=True)
-        try:
-            await interaction.user.add_roles(role, reason="Verified via button")
-            await interaction.response.send_message(f"✅ Verified! You now have the **{role.name}** role.", ephemeral=True)
-        except discord.Forbidden:
-            await interaction.response.send_message("❌ I don't have permission to give that role.", ephemeral=True)
-
-class CloseTicketButton(discord.ui.View):
-    def __init__(self): super().__init__(timeout=None)
-
-    @discord.ui.button(label="🔒 Close Ticket", style=discord.ButtonStyle.danger, custom_id="close_ticket")
-    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        channel    = interaction.channel
-        is_admin   = interaction.user.guild_permissions.administrator
-        is_creator = str(interaction.user.id) in (channel.topic or "")
-        staff_role = discord.utils.get(interaction.guild.roles, name="Staff")
-        is_staff_r = staff_role and staff_role in interaction.user.roles
-        if not (is_admin or is_creator or is_staff_r):
-            return await interaction.response.send_message("❌ Only the ticket owner or Staff can close this.", ephemeral=True)
-        await interaction.response.send_message("🔒 Closing ticket...")
-        await channel.delete(reason=f"Closed by {interaction.user}")
-
-class TicketButton(discord.ui.View):
-    def __init__(self): super().__init__(timeout=None)
-
-    @discord.ui.button(label="🎫 Create Ticket", style=discord.ButtonStyle.primary, custom_id="create_ticket")
-    async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild     = interaction.guild
-        guild_cfg = config.setdefault(str(guild.id), {})
-        count     = guild_cfg.get("ticket_count", 0) + 1
-        guild_cfg["ticket_count"] = count
-        save_config(config)
-        existing = discord.utils.get(guild.text_channels, topic=f"ticket-owner-{interaction.user.id}")
-        if existing:
-            return await interaction.response.send_message(f"You already have a ticket: {existing.mention}", ephemeral=True)
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            interaction.user:   discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-            guild.me:           discord.PermissionOverwrite(view_channel=True, send_messages=True),
+// ══════════════════════════════════════════════════════════════════════════════
+// HOTKEY TYPE
+// ══════════════════════════════════════════════════════════════════════════════
+#[derive(Clone, PartialEq, Debug)]
+enum HotKey {
+    Keyboard(Key),
+    MouseBtn(u32),  // raw button code — detected at bind time
+}
+impl HotKey {
+    fn display(&self) -> String {
+        match self {
+            HotKey::Keyboard(k) => key_name(k).to_string(),
+            HotKey::MouseBtn(n) => format!("Mouse {}", n),
         }
-        for role in guild.roles:
-            if role.permissions.administrator:
-                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-        staff_role = discord.utils.get(guild.roles, name="Staff")
-        if staff_role:
-            overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-        category = discord.utils.get(guild.categories, name="Tickets") or \
-                   await guild.create_category("Tickets", overwrites={guild.default_role: discord.PermissionOverwrite(view_channel=False)})
-        channel = await guild.create_text_channel(
-            name=f"ticket-{count:04d}", category=category,
-            overwrites=overwrites, topic=f"ticket-owner-{interaction.user.id}"
-        )
-        embed = discord.Embed(
-            title=f"🎫 Ticket #{count:04d}",
-            description=f"Welcome {interaction.user.mention}!\n\nDescribe your issue and staff will assist shortly.\n\nClick below to close.",
-            color=discord.Color.green()
-        )
-        await channel.send(embed=embed, view=CloseTicketButton())
-        await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  EVENTS
-# ══════════════════════════════════════════════════════════════════════════════
-@bot.event
-async def on_ready():
-    bot.add_view(VerifyButton())
-    bot.add_view(TicketButton())
-    bot.add_view(CloseTicketButton())
-    update_stats.start()
-    await bot.tree.sync()
-    print(f"✅ {bot.user} online!")
-
-@tasks.loop(minutes=10)
-async def update_stats():
-    for guild in bot.guilds:
-        channels = config.get(str(guild.id), {}).get("stats_channels", {})
-        if not channels: continue
-        try:
-            if channels.get("members"):
-                ch = guild.get_channel(int(channels["members"]))
-                if ch: await ch.edit(name=f"👥 Members: {guild.member_count}")
-            if channels.get("humans"):
-                ch = guild.get_channel(int(channels["humans"]))
-                if ch: await ch.edit(name=f"👤 Humans: {sum(1 for m in guild.members if not m.bot)}")
-            if channels.get("bots"):
-                ch = guild.get_channel(int(channels["bots"]))
-                if ch: await ch.edit(name=f"🤖 Bots: {sum(1 for m in guild.members if m.bot)}")
-        except: pass
-
-@bot.event
-async def on_member_join(member):
-    guild_cfg = config.get(str(member.guild.id), {})
-    if guild_cfg.get("automod_antiraid"):
-        now = datetime.datetime.utcnow()
-        recent_join.append(now)
-        recent_join[:] = [t for t in recent_join if (now-t).total_seconds() < 10]
-        if len(recent_join) >= 5:
-            try: await member.kick(reason="Anti-raid"); return
-            except: pass
-    wc = guild_cfg.get("welcome_channel")
-    wm = guild_cfg.get("welcome_message", "Welcome {mention}!")
-    if wc:
-        ch = member.guild.get_channel(int(wc))
-        if ch:
-            await ch.send(wm.replace("{mention}", member.mention)
-                           .replace("{name}", member.display_name)
-                           .replace("{server}", member.guild.name))
-
-@bot.event
-async def on_member_remove(member):
-    lc = get_setting(member.guild.id, "leave_channel")
-    if lc:
-        ch = member.guild.get_channel(int(lc))
-        if ch: await ch.send(f"👋 **{member.display_name}** left the server.")
-
-@bot.event
-async def on_message_delete(message):
-    if message.author.bot: return
-    snipe_data[message.channel.id] = {
-        "content": message.content or "[no text]",
-        "author":  str(message.author),
-        "avatar":  str(message.author.display_avatar.url),
-        "time":    datetime.datetime.utcnow(),
     }
+}
+fn btn_to_num(b: &rdev::Button) -> u32 {
+    match b {
+        rdev::Button::Left    => 1,
+        rdev::Button::Right   => 2,
+        rdev::Button::Middle  => 3,
+        rdev::Button::Unknown(n) => *n as u32,
+    }
+}
 
-@bot.event
-async def on_message(message):
-    if message.author.bot or not message.guild:
-        await bot.process_commands(message); return
-    guild_cfg = config.get(str(message.guild.id), {})
-    member    = message.author
-    if guild_cfg.get("automod_badwords"):
-        if any(w in message.content.lower() for w in guild_cfg.get("bad_words", [])):
-            try:
-                await message.delete()
-                await message.channel.send(f"🚫 {member.mention} Watch your language!", delete_after=5)
-            except: pass
-    if guild_cfg.get("automod_antilink"):
-        if re.search(r"(https?://|discord\.gg/|www\.)\S+", message.content):
-            if not member.guild_permissions.administrator:
-                try:
-                    await message.delete()
-                    await message.channel.send(f"🔗 {member.mention} Links not allowed!", delete_after=5)
-                except: pass
-    if guild_cfg.get("automod_antispam"):
-        now = datetime.datetime.utcnow()
-        uid = member.id
-        spam_track.setdefault(uid, [])
-        spam_track[uid] = [t for t in spam_track[uid] if (now-t).total_seconds() < 5]
-        spam_track[uid].append(now)
-        if len(spam_track[uid]) >= 5:
-            try:
-                await member.timeout(discord.utils.utcnow() + timedelta(minutes=2), reason="Anti-spam")
-                await message.channel.send(f"🛑 {member.mention} muted for spamming!", delete_after=5)
-                spam_track[uid] = []
-            except: pass
-    await bot.process_commands(message)
+fn key_name(k: &Key) -> &str {
+    match k {
+        Key::KeyA=>"A",Key::KeyB=>"B",Key::KeyC=>"C",Key::KeyD=>"D",Key::KeyE=>"E",
+        Key::KeyF=>"F",Key::KeyG=>"G",Key::KeyH=>"H",Key::KeyI=>"I",Key::KeyJ=>"J",
+        Key::KeyK=>"K",Key::KeyL=>"L",Key::KeyM=>"M",Key::KeyN=>"N",Key::KeyO=>"O",
+        Key::KeyP=>"P",Key::KeyQ=>"Q",Key::KeyR=>"R",Key::KeyS=>"S",Key::KeyT=>"T",
+        Key::KeyU=>"U",Key::KeyV=>"V",Key::KeyW=>"W",Key::KeyX=>"X",Key::KeyY=>"Y",
+        Key::KeyZ=>"Z",Key::Num0=>"0",Key::Num1=>"1",Key::Num2=>"2",Key::Num3=>"3",
+        Key::Num4=>"4",Key::Num5=>"5",Key::Num6=>"6",Key::Num7=>"7",Key::Num8=>"8",
+        Key::Num9=>"9",Key::F1=>"F1",Key::F2=>"F2",Key::F3=>"F3",Key::F4=>"F4",
+        Key::F5=>"F5",Key::F6=>"F6",Key::F7=>"F7",Key::F8=>"F8",Key::F9=>"F9",
+        Key::F10=>"F10",Key::F11=>"F11",Key::F12=>"F12",Key::Tab=>"TAB",_=>"?",
+    }
+}
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  COMMANDS — OWNER
-# ══════════════════════════════════════════════════════════════════════════════
-@bot.tree.command(name="sync", description="Sync slash commands")
-async def slash_sync(interaction: discord.Interaction):
-    if interaction.user.id != OWNER_ID:
-        return await interaction.response.send_message("❌ No permission.", ephemeral=True)
-    await bot.tree.sync()
-    await interaction.response.send_message("✅ Synced!", ephemeral=True)
+// ══════════════════════════════════════════════════════════════════════════════
+// KEY SYSTEM
+// ══════════════════════════════════════════════════════════════════════════════
+const BAN_CHECK_URL: &str = "https://discord-bot-production-cc70.up.railway.app/bans";
 
-@bot.tree.command(name="key", description="Generate a NATIVE license key")
-@app_commands.describe(machine_id="16-char Machine ID", duration="10m / 2h / 7d / permanent", user="Send key to user")
-async def slash_key(interaction: discord.Interaction, machine_id: str, duration: str = "permanent", user: discord.Member = None):
-    if interaction.user.id != OWNER_ID:
-        return await interaction.response.send_message("❌ No permission.", ephemeral=True)
-    cleaned = machine_id.strip().upper().replace("-","").replace(" ","")
-    if len(cleaned) != 16 or not all(c in "0123456789ABCDEF" for c in cleaned):
-        return await interaction.response.send_message(f"❌ Invalid Machine ID: `{machine_id}`", ephemeral=True)
-    hw_id   = int(cleaned, 16)
-    key     = derive_key(hw_id)
-    secs    = parse_duration(duration)
-    is_perm = secs is None
-    if is_perm:
-        expiry_label = "Never (Permanent)"
-        paste_key    = key
-    else:
-        expiry_ts    = int(datetime.datetime.utcnow().timestamp()) + secs
-        expiry_label = f"<t:{expiry_ts}:F> (<t:{expiry_ts}:R>)"
-        paste_key    = f"{key}:{expiry_ts}"
-    embed = discord.Embed(
-        title="🔑 NATIVE License Key",
-        color=discord.Color.from_rgb(0,185,255) if is_perm else discord.Color.orange()
-    )
-    embed.add_field(name="Machine ID",  value=f"`{cleaned}`",       inline=False)
-    embed.add_field(name="License Key", value=f"```{paste_key}```", inline=False)
-    embed.add_field(name="Expires",     value=expiry_label,         inline=False)
-    embed.set_footer(text="Key only works on that machine.")
-    await interaction.response.defer(ephemeral=True)
-    await interaction.followup.send(embed=embed, ephemeral=True)
-    if user:
-        try:
-            await user.send(f"🔑 Your NATIVE key from {interaction.user.display_name}:", embed=embed)
-            await interaction.followup.send(f"✅ Sent to {user.mention} via DM!", ephemeral=True)
-        except discord.Forbidden:
-            msg = await interaction.channel.send(f"{user.mention} — your NATIVE key:", embed=embed)
-            await interaction.followup.send("⚠️ DMs disabled — posted in channel, deletes in 30s.", ephemeral=True)
-            await asyncio.sleep(30)
-            try: await msg.delete()
-            except: pass
+const SECRET: u64       = 0xA3F7_C291_5E6B_D840;
+const DEV_PASSWORD: &str = "NATIVE2025DEV";
+const DEV_OWNER_HW: u64 = 0x28376045325BD3EA;
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  COMMANDS — BAN SYSTEM
-# ══════════════════════════════════════════════════════════════════════════════
-@bot.tree.command(name="banmachineid", description="Ban a machine ID — kicks them out within 10 seconds")
-@app_commands.describe(machine_id="16-character machine ID")
-@is_staff()
-async def slash_banmachineid(interaction: discord.Interaction, machine_id: str):
-    hwid = machine_id.strip().upper().replace("-","").replace(" ","")
-    if len(hwid) != 16:
-        return await interaction.response.send_message("❌ Must be 16 hex characters.", ephemeral=True)
-    banned_hwids.add(hwid)
-    save_bans()
-    await interaction.response.send_message(f"✅ `{hwid}` banned — they will be kicked within 10 seconds.", ephemeral=True)
+fn fnv64(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in data { h ^= b as u64; h = h.wrapping_mul(0x00000001000000b3); }
+    h
+}
+fn get_hw_id() -> u64 {
+    let c = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "X".into());
+    let u = std::env::var("USERNAME").unwrap_or_else(|_| "X".into());
+    fnv64(format!("NATIVE-{}-{}", c.to_uppercase(), u.to_uppercase()).as_bytes())
+}
+fn derive_key(hw: u64) -> String {
+    let a = fnv64(&(hw ^ SECRET).to_le_bytes());
+    let b = fnv64(&(hw ^ SECRET ^ 0x1234567890abcdef).to_le_bytes());
+    let c = fnv64(&(hw ^ SECRET ^ 0xfedcba9876543210).to_le_bytes());
+    format!("NTVE-{:04X}-{:04X}-{:04X}-{:04X}-{:04X}",
+        (a>>48) as u16,(a>>32) as u16,(b>>48) as u16,(b>>32) as u16,(c>>48) as u16)
+}
+fn validate_key(key: &str) -> bool {
+    let trimmed = key.trim().to_uppercase();
+    // Key is always 29 chars: NTVE-XXXX-XXXX-XXXX-XXXX-XXXX
+    let clean = if trimmed.len() >= 29 && trimmed.starts_with("NTVE-") {
+        &trimmed[..29]
+    } else {
+        trimmed.split(':').next().unwrap_or(&trimmed)
+    };
+    // Check key matches machine
+    if clean != derive_key(get_hw_id()) { return false; }
+    // Check expiry — anything after position 29 (with or without colon) is the timestamp
+    let suffix = if trimmed.len() > 29 {
+        trimmed[29..].trim_start_matches(':').trim()
+    } else { "" };
+    if !suffix.is_empty() && suffix != "NEVER" {
+        if let Ok(exp) = suffix.parse::<u64>() {
+            let now_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_secs();
+            if now_ts >= exp { return false; } // expired — reject
+        }
+    }
+    true
+}
+fn is_dev_owner() -> bool { get_hw_id() == DEV_OWNER_HW }
 
-@bot.tree.command(name="unbanmachineid", description="Unban a machine ID")
-@app_commands.describe(machine_id="Machine ID to unban")
-@is_staff()
-async def slash_unbanmachineid(interaction: discord.Interaction, machine_id: str):
-    hwid = machine_id.strip().upper().replace("-","").replace(" ","")
-    if hwid in banned_hwids:
-        banned_hwids.discard(hwid); save_bans()
-        await interaction.response.send_message(f"✅ `{hwid}` unbanned.", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"❌ `{hwid}` is not banned.", ephemeral=True)
+fn license_path() -> Option<std::path::PathBuf> {
+    std::env::var("APPDATA").ok().map(|p| {
+        let mut path = std::path::PathBuf::from(p);
+        path.push("Native"); path.push("license.key"); path
+    })
+}
+fn save_license(key: &str) {
+    if let Some(path) = license_path() {
+        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).ok(); }
+        let trimmed = key.trim().to_uppercase();
+        // Key is always exactly 29 chars: NTVE-XXXX-XXXX-XXXX-XXXX-XXXX
+        // Anything after position 29 is the expiry timestamp (with or without colon)
+        let key_part = if trimmed.len() >= 29 { &trimmed[..29] } else { &trimmed };
+        let suffix   = if trimmed.len() > 29 { trimmed[29..].trim_start_matches(':') } else { "" };
+        let expiry   = if suffix.is_empty() { "NEVER".to_string() } else { suffix.to_string() };
+        let hw       = format!("{:016X}", get_hw_id());
+        let content  = format!("{}:{}:{}", key_part, hw, expiry);
+        std::fs::write(path, content).ok();
+    }
+}
+fn load_expiry() -> Option<u64> {
+    let path = {
+        let mut p = std::env::var("APPDATA").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from("."));
+        p.push("Native"); p.push("license.key");
+        p
+    };
+    let text = std::fs::read_to_string(&path).ok()?;
+    // Format on disk: NTVE-XXXX-XXXX-XXXX-XXXX-XXXX:HWID:EXPIRY
+    // Split by ':' — key part has dashes not colons, so parts are:
+    // [0] = NTVE-XXXX-XXXX-XXXX-XXXX-XXXX, [1] = HWID, [2] = EXPIRY
+    let parts: Vec<&str> = text.trim().split(':').collect();
+    let expiry_str = parts.get(2)?;
+    if *expiry_str == "NEVER" { return None; }
+    expiry_str.parse::<u64>().ok()
+}
 
-@bot.tree.command(name="listbans", description="List all banned machine IDs")
-@is_staff()
-async def slash_listbans(interaction: discord.Interaction):
-    if not banned_hwids:
-        return await interaction.response.send_message("No banned machine IDs.", ephemeral=True)
-    embed = discord.Embed(title="🔨 Banned Machine IDs", color=discord.Color.red())
-    embed.description = "\n".join(f"`{h}`" for h in sorted(banned_hwids))
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+// ══════════════════════════════════════════════════════════════════════════════
+// SETTINGS
+// ══════════════════════════════════════════════════════════════════════════════
+fn settings_path() -> Option<std::path::PathBuf> {
+    std::env::var("APPDATA").ok().map(|p| {
+        let mut path = std::path::PathBuf::from(p);
+        path.push("Native"); path.push("settings.cfg"); path
+    })
+}
+struct Settings {
+    kps: u64, jitter: u64, button: u8, toggle_mode: bool,
+    burst_count: u64, always_on_top: bool, hotkey: String,
+    accent_r: u8, accent_g: u8, accent_b: u8,
+    outline_r: u8, outline_g: u8, outline_b: u8,
+    panel_a: u8,
+    key_enabled: bool, key_vk: u16,
+}
+impl Default for Settings {
+    fn default() -> Self { Self {
+        kps:20, jitter:0, button:0, toggle_mode:false,
+        burst_count:1, always_on_top:false, hotkey:"KeyF".into(),
+        accent_r:0, accent_g:180, accent_b:255,
+        outline_r:0, outline_g:90, outline_b:175, panel_a:235,
+        key_enabled:false, key_vk:0x46,
+    }}
+}
+impl Settings {
+    fn save(&self) {
+        if let Some(path) = settings_path() {
+            if let Some(p) = path.parent() { std::fs::create_dir_all(p).ok(); }
+            std::fs::write(path, format!(
+                "kps={}\njitter={}\nbutton={}\ntoggle={}\nburst={}\naot={}\nhotkey={}\naccent={},{},{}\noutline={},{},{}\npanel_a={}\nkeyenabled={}\nkeyvk={}",
+                self.kps,self.jitter,self.button,self.toggle_mode as u8,
+                self.burst_count,self.always_on_top as u8,self.hotkey,
+                self.accent_r,self.accent_g,self.accent_b,
+                self.outline_r,self.outline_g,self.outline_b,self.panel_a,
+            self.key_enabled as u8, self.key_vk,
+            )).ok();
+        }
+    }
+    fn load() -> Self {
+        let mut s = Settings::default();
+        let path = match settings_path() { Some(p)=>p, None=>return s };
+        let content = match std::fs::read_to_string(path) { Ok(c)=>c, Err(_)=>return s };
+        for line in content.lines() {
+            let mut parts = line.splitn(2,'=');
+            let k = parts.next().unwrap_or("").trim();
+            let v = parts.next().unwrap_or("").trim();
+            match k {
+                "kps"     => { if let Ok(x)=v.parse(){s.kps=x;} }
+                "jitter"  => { if let Ok(x)=v.parse(){s.jitter=x;} }
+                "button"  => { if let Ok(x)=v.parse(){s.button=x;} }
+                "toggle"  => { s.toggle_mode=v=="1"; }
+                "burst"   => { if let Ok(x)=v.parse(){s.burst_count=x;} }
+                "aot"     => { s.always_on_top=v=="1"; }
+                "hotkey"  => { s.hotkey=v.to_string(); }
+                "accent"  => { let c:Vec<u8>=v.split(',').filter_map(|x|x.parse().ok()).collect();
+                                if c.len()==3{s.accent_r=c[0];s.accent_g=c[1];s.accent_b=c[2];} }
+                "outline" => { let c:Vec<u8>=v.split(',').filter_map(|x|x.parse().ok()).collect();
+                                if c.len()==3{s.outline_r=c[0];s.outline_g=c[1];s.outline_b=c[2];} }
+                "panel_a" => { if let Ok(x)=v.parse(){s.panel_a=x;} }
+                "keyenabled" => { s.key_enabled = v.trim()=="1"; }
+                "keyvk"      => { if let Ok(x)=v.parse(){s.key_vk=x;} }
+                _ => {}
+            }
+        }
+        s
+    }
+}
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  COMMANDS — PERM COUNTER
-# ══════════════════════════════════════════════════════════════════════════════
-@bot.tree.command(name="add", description="Add to the perm counter")
-@app_commands.describe(amount="Number to add")
-@is_staff()
-async def slash_add(interaction: discord.Interaction, amount: int):
-    gid = str(interaction.guild_id)
-    perm_counter[gid] = perm_counter.get(gid, 0) + amount
-    await interaction.response.send_message(f"✅ Added **{amount}** — total: **{perm_counter[gid]}**", ephemeral=True)
-
-@bot.tree.command(name="remove", description="Remove from the perm counter")
-@app_commands.describe(amount="Number to remove")
-@is_staff()
-async def slash_remove(interaction: discord.Interaction, amount: int):
-    gid = str(interaction.guild_id)
-    perm_counter[gid] = perm_counter.get(gid, 0) - amount
-    await interaction.response.send_message(f"✅ Removed **{amount}** — total: **{perm_counter[gid]}**", ephemeral=True)
-
-@bot.tree.command(name="show", description="Show the perm counter")
-@is_staff()
-async def slash_show(interaction: discord.Interaction):
-    total = perm_counter.get(str(interaction.guild_id), 0)
-    embed = discord.Embed(title="🔢 Perm Counter", description=f"**{total}**", color=discord.Color.from_rgb(0,185,255))
-    embed.set_footer(text="NATIVE • Staff only")
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="resetcounter", description="Reset the perm counter to 0")
-@is_staff()
-async def slash_resetcounter(interaction: discord.Interaction):
-    perm_counter[str(interaction.guild_id)] = 0
-    await interaction.response.send_message("✅ Counter reset to **0**.", ephemeral=True)
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  COMMANDS — VERIFICATION
-# ══════════════════════════════════════════════════════════════════════════════
-@bot.tree.command(name="setverifyrole", description="Set the role given on verify")
-@app_commands.describe(role="Role to give")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def slash_setverifyrole(interaction: discord.Interaction, role: discord.Role):
-    set_setting(interaction.guild_id, "verify_role", str(role.id))
-    await interaction.response.send_message(f"✅ Verify role set to **{role.name}**.", ephemeral=True)
-
-@bot.tree.command(name="sendverify", description="Send the verify embed in this channel")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def slash_sendverify(interaction: discord.Interaction):
-    role_id = get_setting(interaction.guild_id, "verify_role")
-    if not role_id:
-        return await interaction.response.send_message("❌ Set a verify role first with /setverifyrole.", ephemeral=True)
-    embed = discord.Embed(
-        title="🔒  Welcome to NATIVE",
-        description="Click the button below to verify yourself and get access to the server.",
-        color=discord.Color.from_rgb(0,185,255)
-    )
-    embed.set_footer(text="NATIVE • Click once to verify")
-    await interaction.channel.send(embed=embed, view=VerifyButton())
-    await interaction.response.send_message("✅ Verify message sent!", ephemeral=True)
-
-@bot.tree.command(name="setupverify", description="Create Member role and send verify message")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_setupverify(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    guild = interaction.guild
-    role  = discord.utils.get(guild.roles, name="Member")
-    if not role:
-        role = await guild.create_role(name="Member", color=discord.Color.from_rgb(0,185,255))
-        msg  = "✅ Created **Member** role"
-    else:
-        msg = "✅ Found existing **Member** role"
-    set_setting(guild.id, "verify_role", str(role.id))
-    embed = discord.Embed(
-        title="🔒  Welcome to NATIVE",
-        description="Click the button below to get access to the server.",
-        color=discord.Color.from_rgb(0,185,255)
-    )
-    embed.set_footer(text="NATIVE • Click once to verify")
-    await interaction.channel.send(embed=embed, view=VerifyButton())
-    await interaction.followup.send(
-        f"{msg}\n✅ Verify role saved\n✅ Verify message sent\n\n"
-        "⚠️ Make sure the bot role is **above** Member in Server Settings → Roles.",
-        ephemeral=True
-    )
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  COMMANDS — TICKETS
-# ══════════════════════════════════════════════════════════════════════════════
-@bot.tree.command(name="ticketsetup", description="Send the ticket panel")
-@app_commands.describe(channel="Channel for the panel")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_ticketsetup(interaction: discord.Interaction, channel: discord.TextChannel):
-    embed = discord.Embed(title="🎫 Support Tickets", description="Click below to open a ticket!", color=discord.Color.blurple())
-    await channel.send(embed=embed, view=TicketButton())
-    await interaction.response.send_message(f"✅ Ticket panel sent to {channel.mention}!", ephemeral=True)
-
-@bot.tree.command(name="close", description="Close the current ticket")
-async def slash_close(interaction: discord.Interaction):
-    channel = interaction.channel
-    if not (channel.topic and channel.topic.startswith("ticket-owner-")):
-        return await interaction.response.send_message("❌ Not a ticket channel.", ephemeral=True)
-    owner_id   = int(channel.topic.replace("ticket-owner-",""))
-    is_owner   = interaction.user.id == owner_id
-    is_admin   = interaction.user.guild_permissions.administrator
-    staff_role = discord.utils.get(interaction.guild.roles, name="Staff")
-    is_staff_r = staff_role and staff_role in interaction.user.roles
-    if not (is_owner or is_admin or is_staff_r):
-        return await interaction.response.send_message("❌ Only the ticket owner or Staff can close this.", ephemeral=True)
-    await interaction.response.send_message("🔒 Closing ticket...")
-    await channel.delete(reason=f"Closed by {interaction.user}")
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  COMMANDS — MODERATION
-# ══════════════════════════════════════════════════════════════════════════════
-@bot.tree.command(name="kick", description="Kick a member")
-@app_commands.describe(member="Member", reason="Reason")
-@app_commands.checks.has_permissions(kick_members=True)
-async def slash_kick(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason"):
-    await member.kick(reason=reason)
-    await interaction.response.send_message(f"👢 Kicked **{member.display_name}**. Reason: {reason}")
-
-@bot.tree.command(name="ban", description="Ban a member")
-@app_commands.describe(member="Member", reason="Reason")
-@app_commands.checks.has_permissions(ban_members=True)
-async def slash_ban(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason"):
-    await member.ban(reason=reason, delete_message_days=0)
-    await interaction.response.send_message(f"🔨 Banned **{member.display_name}**. Reason: {reason}")
-
-@bot.tree.command(name="unban", description="Unban a user by ID")
-@app_commands.describe(user_id="User ID")
-@app_commands.checks.has_permissions(ban_members=True)
-async def slash_unban(interaction: discord.Interaction, user_id: str):
-    async for entry in interaction.guild.bans():
-        if str(entry.user.id) == user_id:
-            await interaction.guild.unban(entry.user)
-            return await interaction.response.send_message(f"✅ Unbanned **{entry.user}**.")
-    await interaction.response.send_message("❌ Not found.")
-
-@bot.tree.command(name="mute", description="Timeout a member")
-@app_commands.describe(member="Member", minutes="Minutes", reason="Reason")
-@app_commands.checks.has_permissions(moderate_members=True)
-async def slash_mute(interaction: discord.Interaction, member: discord.Member, minutes: int = 10, reason: str = "No reason"):
-    await member.timeout(discord.utils.utcnow() + timedelta(minutes=minutes), reason=reason)
-    await interaction.response.send_message(f"🔇 Muted **{member.display_name}** for {minutes}min.")
-
-@bot.tree.command(name="unmute", description="Remove timeout")
-@app_commands.describe(member="Member")
-@app_commands.checks.has_permissions(moderate_members=True)
-async def slash_unmute(interaction: discord.Interaction, member: discord.Member):
-    await member.timeout(None)
-    await interaction.response.send_message(f"🔊 Unmuted **{member.display_name}**.")
-
-@bot.tree.command(name="warn", description="Warn a member")
-@app_commands.describe(member="Member", reason="Reason")
-@app_commands.checks.has_permissions(kick_members=True)
-async def slash_warn(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason"):
-    warnings.setdefault(member.id, []).append(reason)
-    await interaction.response.send_message(f"⚠️ Warned **{member.display_name}** ({len(warnings[member.id])} total). Reason: {reason}")
-    try: await member.send(f"⚠️ Warned in **{interaction.guild.name}**: {reason}")
-    except: pass
-
-@bot.tree.command(name="warnings", description="View warnings")
-@app_commands.describe(member="Member")
-@app_commands.checks.has_permissions(kick_members=True)
-async def slash_warnings(interaction: discord.Interaction, member: discord.Member):
-    w = warnings.get(member.id, [])
-    if not w: return await interaction.response.send_message(f"✅ {member.display_name} has no warnings.")
-    embed = discord.Embed(title=f"Warnings — {member.display_name}", color=discord.Color.orange())
-    for i, r in enumerate(w, 1): embed.add_field(name=f"Warning {i}", value=r, inline=False)
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="clearwarnings", description="Clear warnings")
-@app_commands.describe(member="Member")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_clearwarnings(interaction: discord.Interaction, member: discord.Member):
-    warnings.pop(member.id, None)
-    await interaction.response.send_message(f"✅ Cleared warnings for **{member.display_name}**.")
-
-@bot.tree.command(name="purge", description="Delete messages")
-@app_commands.describe(amount="Amount (max 100)")
-@app_commands.checks.has_permissions(manage_messages=True)
-async def slash_purge(interaction: discord.Interaction, amount: int):
-    await interaction.response.defer(ephemeral=True)
-    deleted = await interaction.channel.purge(limit=min(amount, 100))
-    await interaction.followup.send(f"🗑️ Deleted {len(deleted)} messages.", ephemeral=True)
-
-@bot.tree.command(name="slowmode", description="Set slowmode")
-@app_commands.describe(seconds="Seconds (0=off)")
-@app_commands.checks.has_permissions(manage_channels=True)
-async def slash_slowmode(interaction: discord.Interaction, seconds: int):
-    await interaction.channel.edit(slowmode_delay=seconds)
-    await interaction.response.send_message(f"✅ Slowmode {'disabled' if seconds==0 else f'set to {seconds}s'}.")
-
-@bot.tree.command(name="lock", description="Lock this channel")
-@app_commands.checks.has_permissions(manage_channels=True)
-async def slash_lock(interaction: discord.Interaction):
-    ow = interaction.channel.overwrites_for(interaction.guild.default_role)
-    ow.send_messages = False
-    await interaction.channel.set_permissions(interaction.guild.default_role, overwrite=ow)
-    await interaction.response.send_message("🔒 Channel locked.")
-
-@bot.tree.command(name="unlock", description="Unlock this channel")
-@app_commands.checks.has_permissions(manage_channels=True)
-async def slash_unlock(interaction: discord.Interaction):
-    ow = interaction.channel.overwrites_for(interaction.guild.default_role)
-    ow.send_messages = True
-    await interaction.channel.set_permissions(interaction.guild.default_role, overwrite=ow)
-    await interaction.response.send_message("🔓 Channel unlocked.")
-
-@bot.tree.command(name="nick", description="Change nickname")
-@app_commands.describe(member="Member", nickname="New nickname (blank to reset)")
-@app_commands.checks.has_permissions(manage_nicknames=True)
-async def slash_nick(interaction: discord.Interaction, member: discord.Member, nickname: str = None):
-    await member.edit(nick=nickname)
-    await interaction.response.send_message(f"✅ Nickname {'reset' if not nickname else f'set to **{nickname}**'}.")
-
-@bot.tree.command(name="addrole", description="Give a role to a member")
-@app_commands.describe(member="Member", role="Role")
-@app_commands.checks.has_permissions(manage_roles=True)
-async def slash_addrole(interaction: discord.Interaction, member: discord.Member, role: discord.Role):
-    await member.add_roles(role)
-    await interaction.response.send_message(f"✅ Added **{role.name}** to **{member.display_name}**.")
-
-@bot.tree.command(name="removerole", description="Remove a role from a member")
-@app_commands.describe(member="Member", role="Role")
-@app_commands.checks.has_permissions(manage_roles=True)
-async def slash_removerole(interaction: discord.Interaction, member: discord.Member, role: discord.Role):
-    await member.remove_roles(role)
-    await interaction.response.send_message(f"✅ Removed **{role.name}** from **{member.display_name}**.")
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  COMMANDS — SETUP
-# ══════════════════════════════════════════════════════════════════════════════
-@bot.tree.command(name="setwelcome", description="Set welcome channel and message")
-@app_commands.describe(channel="Channel", message="Use {mention} {name} {server}")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_setwelcome(interaction: discord.Interaction, channel: discord.TextChannel, message: str = "Welcome {mention}! 🎉"):
-    set_setting(interaction.guild.id, "welcome_channel", str(channel.id))
-    set_setting(interaction.guild.id, "welcome_message", message)
-    await interaction.response.send_message(f"✅ Welcome channel set to {channel.mention}.")
-
-@bot.tree.command(name="setleave", description="Set leave channel")
-@app_commands.describe(channel="Channel")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_setleave(interaction: discord.Interaction, channel: discord.TextChannel):
-    set_setting(interaction.guild.id, "leave_channel", str(channel.id))
-    await interaction.response.send_message(f"✅ Leave channel set to {channel.mention}.")
-
-@bot.tree.command(name="setupstats", description="Create stat channels")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_setupstats(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    guild = interaction.guild
-    cat   = discord.utils.get(guild.categories, name="📊 Server Stats") or \
-            await guild.create_category("📊 Server Stats", overwrites={
-                guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
-                guild.me:           discord.PermissionOverwrite(view_channel=True, manage_channels=True)
+// ── User Presets ──────────────────────────────────────────────────────────────
+#[derive(Clone)]
+struct Preset {
+    name:     String,
+    kps:      u64,
+    accent:   [u8;3],
+    outline:  [u8;3],
+    panel_a:  u8,
+    bg_path:  String, // empty = default
+}
+impl Preset {
+    fn presets_dir() -> Option<std::path::PathBuf> {
+        std::env::var("APPDATA").ok().map(|a| {
+            let mut p = std::path::PathBuf::from(a);
+            p.push("Native"); p.push("presets"); p
+        })
+    }
+    fn save_all(presets: &[Preset]) {
+        if let Some(dir) = Self::presets_dir() {
+            std::fs::create_dir_all(&dir).ok();
+            // Write index file
+            let lines: Vec<String> = presets.iter().enumerate().map(|(i, p)| {
+                format!("{}|{}|{},{},{}|{},{},{}|{}|{}",
+                    i, p.name,
+                    p.accent[0],p.accent[1],p.accent[2],
+                    p.outline[0],p.outline[1],p.outline[2],
+                    p.panel_a, p.kps)
+            }).collect();
+            std::fs::write(dir.join("index.cfg"), lines.join("\n")).ok();
+            // Write bg paths
+            let bg_lines: Vec<String> = presets.iter().enumerate().map(|(i,p)| {
+                format!("{}={}", i, p.bg_path)
+            }).collect();
+            std::fs::write(dir.join("bg.cfg"), bg_lines.join("\n")).ok();
+        }
+    }
+    fn load_all() -> Vec<Preset> {
+        let dir = match Self::presets_dir() { Some(d)=>d, None=>return vec![] };
+        let index = match std::fs::read_to_string(dir.join("index.cfg")) { Ok(s)=>s, Err(_)=>return vec![] };
+        let bg_map: std::collections::HashMap<usize,String> = std::fs::read_to_string(dir.join("bg.cfg"))
+            .unwrap_or_default().lines().filter_map(|l| {
+                let mut p = l.splitn(2,'=');
+                let i = p.next()?.trim().parse::<usize>().ok()?;
+                let v = p.next()?.to_string();
+                Some((i,v))
+            }).collect();
+        index.lines().enumerate().filter_map(|(i,line)| {
+            let parts: Vec<&str> = line.splitn(10,'|').collect();
+            if parts.len() < 6 { return None; }
+            let name    = parts[1].to_string();
+            let ac: Vec<u8> = parts[2].split(',').filter_map(|x|x.parse().ok()).collect();
+            let ol: Vec<u8> = parts[3].split(',').filter_map(|x|x.parse().ok()).collect();
+            let panel_a = parts[4].parse::<u8>().unwrap_or(220);
+            let kps     = parts[5].parse::<u64>().unwrap_or(20);
+            if ac.len()<3||ol.len()<3 {return None;}
+            Some(Preset {
+                name, kps,
+                accent:  [ac[0],ac[1],ac[2]],
+                outline: [ol[0],ol[1],ol[2]],
+                panel_a,
+                bg_path: bg_map.get(&i).cloned().unwrap_or_default(),
             })
-    mc = await guild.create_voice_channel(f"👥 Members: {guild.member_count}", category=cat)
-    hc = await guild.create_voice_channel(f"👤 Humans: {sum(1 for m in guild.members if not m.bot)}", category=cat)
-    bc = await guild.create_voice_channel(f"🤖 Bots: {sum(1 for m in guild.members if m.bot)}", category=cat)
-    config.setdefault(str(guild.id), {})["stats_channels"] = {"members":str(mc.id),"humans":str(hc.id),"bots":str(bc.id)}
-    save_config(config)
-    await interaction.followup.send("✅ Stats channels created — updates every 10 min.", ephemeral=True)
-
-@bot.tree.command(name="removestats", description="Remove stat channels")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_removestats(interaction: discord.Interaction):
-    channels = config.get(str(interaction.guild.id), {}).pop("stats_channels", {})
-    save_config(config)
-    for cid in channels.values():
-        ch = interaction.guild.get_channel(int(cid))
-        if ch: await ch.delete()
-    await interaction.response.send_message("✅ Stats channels removed.")
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  COMMANDS — AUTO-MOD
-# ══════════════════════════════════════════════════════════════════════════════
-@bot.tree.command(name="automod", description="Toggle auto-mod features")
-@app_commands.describe(feature="Feature", enabled="On/off")
-@app_commands.choices(feature=[
-    app_commands.Choice(name="Bad Word Filter", value="automod_badwords"),
-    app_commands.Choice(name="Anti-Link",       value="automod_antilink"),
-    app_commands.Choice(name="Anti-Spam",       value="automod_antispam"),
-    app_commands.Choice(name="Anti-Raid",       value="automod_antiraid"),
-])
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_automod(interaction: discord.Interaction, feature: str, enabled: bool):
-    config.setdefault(str(interaction.guild.id), {})[feature] = enabled
-    save_config(config)
-    names = {"automod_badwords":"Bad Word Filter","automod_antilink":"Anti-Link","automod_antispam":"Anti-Spam","automod_antiraid":"Anti-Raid"}
-    await interaction.response.send_message(f"{'✅ Enabled' if enabled else '❌ Disabled'} **{names[feature]}**.")
-
-@bot.tree.command(name="addbadword", description="Add a bad word")
-@app_commands.describe(word="Word to block")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_addbadword(interaction: discord.Interaction, word: str):
-    words = config.setdefault(str(interaction.guild.id), {}).setdefault("bad_words", [])
-    if word.lower() not in words: words.append(word.lower()); save_config(config)
-    await interaction.response.send_message(f"✅ Added **{word}**.", ephemeral=True)
-
-@bot.tree.command(name="removebadword", description="Remove a bad word")
-@app_commands.describe(word="Word to remove")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_removebadword(interaction: discord.Interaction, word: str):
-    words = config.get(str(interaction.guild.id), {}).get("bad_words", [])
-    if word.lower() in words:
-        words.remove(word.lower()); save_config(config)
-        await interaction.response.send_message(f"✅ Removed **{word}**.", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"❌ Not in filter.", ephemeral=True)
-
-@bot.tree.command(name="automodstatus", description="Show auto-mod status")
-@app_commands.checks.has_permissions(administrator=True)
-async def slash_automodstatus(interaction: discord.Interaction):
-    gc  = config.get(str(interaction.guild.id), {})
-    def s(k): return "✅ On" if gc.get(k) else "❌ Off"
-    embed = discord.Embed(title="🛡️ Auto-Mod Status", color=discord.Color.blue())
-    embed.add_field(name="Bad Words", value=s("automod_badwords"), inline=True)
-    embed.add_field(name="Anti-Link", value=s("automod_antilink"), inline=True)
-    embed.add_field(name="Anti-Spam", value=s("automod_antispam"), inline=True)
-    embed.add_field(name="Anti-Raid", value=s("automod_antiraid"), inline=True)
-    cw = gc.get("bad_words", [])
-    embed.add_field(name="Custom Words", value=", ".join(cw) if cw else "None", inline=False)
-    await interaction.response.send_message(embed=embed)
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  COMMANDS — INFO / FUN
-# ══════════════════════════════════════════════════════════════════════════════
-@bot.tree.command(name="ping", description="Check bot latency")
-async def slash_ping(interaction: discord.Interaction):
-    await interaction.response.send_message(f"🏓 Pong! **{round(bot.latency*1000)}ms**")
-
-@bot.tree.command(name="userinfo", description="Get info about a member")
-@app_commands.describe(member="Member")
-async def slash_userinfo(interaction: discord.Interaction, member: discord.Member = None):
-    m = member or interaction.user
-    roles = [r.mention for r in m.roles if r.name != "@everyone"]
-    embed = discord.Embed(title=f"User Info — {m}", color=m.color)
-    embed.set_thumbnail(url=m.display_avatar.url)
-    embed.add_field(name="ID",      value=m.id,                              inline=True)
-    embed.add_field(name="Joined",  value=m.joined_at.strftime("%Y-%m-%d"),  inline=True)
-    embed.add_field(name="Created", value=m.created_at.strftime("%Y-%m-%d"), inline=True)
-    embed.add_field(name=f"Roles ({len(roles)})", value=" ".join(roles) or "None", inline=False)
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="serverinfo", description="Get server info")
-async def slash_serverinfo(interaction: discord.Interaction):
-    g = interaction.guild
-    embed = discord.Embed(title=g.name, color=discord.Color.blurple())
-    if g.icon: embed.set_thumbnail(url=g.icon.url)
-    embed.add_field(name="Owner",    value=g.owner.mention,                  inline=True)
-    embed.add_field(name="Members",  value=g.member_count,                   inline=True)
-    embed.add_field(name="Channels", value=len(g.channels),                  inline=True)
-    embed.add_field(name="Roles",    value=len(g.roles),                     inline=True)
-    embed.add_field(name="Created",  value=g.created_at.strftime("%Y-%m-%d"),inline=True)
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="avatar", description="Show a member's avatar")
-@app_commands.describe(member="Member")
-async def slash_avatar(interaction: discord.Interaction, member: discord.Member = None):
-    m = member or interaction.user
-    embed = discord.Embed(title=f"{m.display_name}'s Avatar", color=discord.Color.blurple())
-    embed.set_image(url=m.display_avatar.url)
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="snipe", description="Show last deleted message")
-async def slash_snipe(interaction: discord.Interaction):
-    data = snipe_data.get(interaction.channel.id)
-    if not data: return await interaction.response.send_message("❌ Nothing to snipe!")
-    embed = discord.Embed(description=data["content"], color=discord.Color.red(), timestamp=data["time"])
-    embed.set_author(name=data["author"], icon_url=data["avatar"])
-    embed.set_footer(text="Deleted message")
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="8ball", description="Ask the magic 8ball")
-@app_commands.describe(question="Your question")
-async def slash_8ball(interaction: discord.Interaction, question: str):
-    embed = discord.Embed(title="🎱 Magic 8-Ball", color=discord.Color.dark_purple())
-    embed.add_field(name="Question", value=question,                       inline=False)
-    embed.add_field(name="Answer",   value=random.choice(["Yes.", "No."]), inline=False)
-    await interaction.response.send_message(embed=embed)
-
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  ID STORE — link Discord users to Machine IDs
-# ══════════════════════════════════════════════════════════════════════════════
-# id_store: { discord_user_id: [hwid1, hwid2, ...] }
-id_store: dict = {}
-
-def load_id_store():
-    try:
-        with open("id_store.json") as f:
-            return json.load(f)
-    except: return {}
-
-def save_id_store():
-    with open("id_store.json", "w") as f:
-        json.dump(id_store, f, indent=2)
-
-id_store = load_id_store()
-
-@bot.tree.command(name="addid", description="Link a Machine ID to a Discord user")
-@app_commands.describe(user="Discord user", machine_id="Their 16-character Machine ID")
-@is_staff()
-async def slash_addid(interaction: discord.Interaction, user: discord.Member, machine_id: str):
-    hwid = machine_id.strip().upper().replace("-","").replace(" ","")
-    if len(hwid) != 16 or not all(c in "0123456789ABCDEF" for c in hwid):
-        return await interaction.response.send_message("❌ Must be 16 hex characters.", ephemeral=True)
-    uid = str(user.id)
-    ids = id_store.setdefault(uid, [])
-    if hwid in ids:
-        return await interaction.response.send_message(f"❌ `{hwid}` is already linked to {user.mention}.", ephemeral=True)
-    ids.append(hwid)
-    save_id_store()
-    embed = discord.Embed(title="✅ ID Linked", color=discord.Color.from_rgb(0,185,255))
-    embed.add_field(name="User", value=user.mention, inline=True)
-    embed.add_field(name="Machine ID", value=f"`{hwid}`", inline=True)
-    embed.set_footer(text=f"Total IDs for this user: {len(ids)}")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="removeid", description="Unlink a Machine ID from a Discord user")
-@app_commands.describe(user="Discord user", machine_id="Machine ID to remove")
-@is_staff()
-async def slash_removeid(interaction: discord.Interaction, user: discord.Member, machine_id: str):
-    hwid = machine_id.strip().upper().replace("-","").replace(" ","")
-    uid = str(user.id)
-    ids = id_store.get(uid, [])
-    if hwid not in ids:
-        return await interaction.response.send_message(f"❌ `{hwid}` is not linked to {user.mention}.", ephemeral=True)
-    ids.remove(hwid)
-    save_id_store()
-    await interaction.response.send_message(f"✅ Removed `{hwid}` from {user.mention}.", ephemeral=True)
-
-@bot.tree.command(name="checkid", description="Check Machine IDs linked to a user")
-@app_commands.describe(user="Discord user to check")
-@is_staff()
-async def slash_checkid(interaction: discord.Interaction, user: discord.Member):
-    uid = str(user.id)
-    ids = id_store.get(uid, [])
-    embed = discord.Embed(
-        title=f"🔍 Machine IDs — {user.display_name}",
-        color=discord.Color.from_rgb(0,185,255)
-    )
-    embed.set_thumbnail(url=user.display_avatar.url)
-    if not ids:
-        embed.description = "No Machine IDs linked to this user."
-    else:
-        for hwid in ids:
-            is_banned = hwid in banned_hwids
-            status = "🔨 BANNED" if is_banned else "✅ Active"
-            embed.add_field(name=f"`{hwid}`", value=status, inline=False)
-    embed.set_footer(text=f"{len(ids)} ID(s) linked")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="whois", description="Find which Discord user owns a Machine ID")
-@app_commands.describe(machine_id="16-character Machine ID to look up")
-@is_staff()
-async def slash_whois(interaction: discord.Interaction, machine_id: str):
-    hwid = machine_id.strip().upper().replace("-","").replace(" ","")
-    found = []
-    for uid, ids in id_store.items():
-        if hwid in ids:
-            member = interaction.guild.get_member(int(uid))
-            found.append(member.mention if member else f"User `{uid}` (left server)")
-    if not found:
-        return await interaction.response.send_message(f"❌ `{hwid}` is not linked to any user.", ephemeral=True)
-    is_banned = hwid in banned_hwids
-    embed = discord.Embed(title="🔍 Machine ID Lookup", color=discord.Color.from_rgb(0,185,255))
-    embed.add_field(name="Machine ID", value=f"`{hwid}`", inline=False)
-    embed.add_field(name="Owner(s)", value="\n".join(found), inline=False)
-    embed.add_field(name="Status", value="🔨 BANNED" if is_banned else "✅ Active", inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  REVOKE KEY — bans machine ID so macro kicks user out within 10s
-# ══════════════════════════════════════════════════════════════════════════════
-@bot.tree.command(name="revokekey", description="Revoke a user's license — bans their machine ID instantly")
-@app_commands.describe(machine_id="Machine ID to revoke (or use user to revoke all their IDs)")
-@is_staff()
-async def slash_revokekey(interaction: discord.Interaction, machine_id: str = None, user: discord.Member = None):
-    if not machine_id and not user:
-        return await interaction.response.send_message("❌ Provide a machine_id or user.", ephemeral=True)
-    
-    revoked = []
-    
-    if machine_id:
-        hwid = machine_id.strip().upper().replace("-","").replace(" ","")
-        if len(hwid) != 16:
-            return await interaction.response.send_message("❌ Must be 16 hex characters.", ephemeral=True)
-        banned_hwids.add(hwid)
-        revoked.append(hwid)
-    
-    if user:
-        uid = str(user.id)
-        for hwid in id_store.get(uid, []):
-            banned_hwids.add(hwid)
-            revoked.append(hwid)
-    
-    if not revoked:
-        return await interaction.response.send_message("❌ No IDs to revoke.", ephemeral=True)
-    
-    save_bans()
-    
-    embed = discord.Embed(
-        title="🔨 License Revoked",
-        color=discord.Color.red()
-    )
-    embed.description = "\n".join(f"`{h}`" for h in revoked)
-    if user:
-        embed.add_field(name="User", value=user.mention, inline=True)
-    embed.add_field(name="Status", value="Macro will kick them within **10 seconds**", inline=False)
-    embed.set_footer(text="NATIVE • License revoked")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="restorekey", description="Restore a revoked license (unban machine ID)")
-@app_commands.describe(machine_id="Machine ID to restore")
-@is_staff()
-async def slash_restorekey(interaction: discord.Interaction, machine_id: str = None, user: discord.Member = None):
-    if not machine_id and not user:
-        return await interaction.response.send_message("❌ Provide a machine_id or user.", ephemeral=True)
-    
-    restored = []
-    
-    if machine_id:
-        hwid = machine_id.strip().upper().replace("-","").replace(" ","")
-        if hwid in banned_hwids:
-            banned_hwids.discard(hwid)
-            restored.append(hwid)
-    
-    if user:
-        uid = str(user.id)
-        for hwid in id_store.get(uid, []):
-            if hwid in banned_hwids:
-                banned_hwids.discard(hwid)
-                restored.append(hwid)
-    
-    if not restored:
-        return await interaction.response.send_message("❌ No banned IDs found to restore.", ephemeral=True)
-    
-    save_bans()
-    embed = discord.Embed(title="✅ License Restored", color=discord.Color.green())
-    embed.description = "\n".join(f"`{h}`" for h in restored)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  POLL SYSTEM
-# ══════════════════════════════════════════════════════════════════════════════
-active_polls: dict = {}  # message_id -> poll data
-
-@bot.tree.command(name="poll", description="Create a poll with up to 4 options")
-@app_commands.describe(
-    question="The poll question",
-    option1="First option",
-    option2="Second option",
-    option3="Third option (optional)",
-    option4="Fourth option (optional)",
-    duration="Duration in minutes (0 = no end, default 0)"
-)
-async def slash_poll(interaction: discord.Interaction,
-                     question: str,
-                     option1: str,
-                     option2: str,
-                     option3: str = None,
-                     option4: str = None,
-                     duration: int = 0):
-    options = [o for o in [option1, option2, option3, option4] if o]
-    emojis  = ["🔵", "🟢", "🟡", "🔴"]
-    
-    embed = discord.Embed(
-        title=f"📊  {question}",
-        color=discord.Color.from_rgb(0, 185, 255)
-    )
-    embed.set_footer(text=f"NATIVE Poll • React to vote{f' • Ends in {duration}m' if duration else ''}")
-    
-    desc = ""
-    for i, opt in enumerate(options):
-        desc += f"{emojis[i]}  **{opt}**\n\n"
-    embed.description = desc.strip()
-    
-    if duration:
-        ends = discord.utils.utcnow() + datetime.timedelta(minutes=duration)
-        embed.add_field(name="⏱️ Ends", value=f"<t:{int(ends.timestamp())}:R>", inline=False)
-    
-    await interaction.response.send_message(embed=embed)
-    msg = await interaction.original_response()
-    
-    for i in range(len(options)):
-        await msg.add_reaction(emojis[i])
-    
-    poll_data = {
-        "question": question,
-        "options": options,
-        "emojis": emojis[:len(options)],
-        "channel_id": interaction.channel_id,
-        "guild_id": interaction.guild_id,
-        "ends": (discord.utils.utcnow() + datetime.timedelta(minutes=duration)).isoformat() if duration else None
+        }).collect()
     }
-    active_polls[msg.id] = poll_data
-    
-    if duration:
-        await asyncio.sleep(duration * 60)
-        if msg.id in active_polls:
-            await end_poll(msg.id, interaction.channel)
+}
 
-async def end_poll(msg_id: int, channel):
-    try:
-        data = active_polls.pop(msg_id, None)
-        if not data: return
-        msg = await channel.fetch_message(msg_id)
-        
-        # Count votes
-        results = []
-        total = 0
-        for i, emoji in enumerate(data["emojis"]):
-            for r in msg.reactions:
-                if str(r.emoji) == emoji:
-                    count = r.count - 1  # subtract bot reaction
-                    results.append((data["options"][i], count, emoji))
-                    total += count
-                    break
-            else:
-                results.append((data["options"][i], 0, emoji))
-        
-        results.sort(key=lambda x: x[1], reverse=True)
-        winner = results[0]
-        
-        embed = discord.Embed(
-            title=f"📊  Poll Ended — {data['question']}",
-            color=discord.Color.from_rgb(0, 220, 100)
-        )
-        desc = ""
-        for opt, count, emoji in results:
-            pct = round((count / total * 100) if total else 0)
-            bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
-            bold = "**" if opt == winner[0] else ""
-            desc += f"{emoji}  {bold}{opt}{bold}\n`{bar}` {pct}% ({count} votes)\n\n"
-        embed.description = desc.strip()
-        embed.set_footer(text=f"NATIVE Poll • {total} total votes • Winner: {winner[0]}")
-        
-        await msg.edit(embed=embed)
-        await channel.send(f"📊 Poll ended! **{winner[0]}** wins with **{winner[1]} votes**!")
-    except Exception as e:
-        print(f"Poll end error: {e}")
-
-@bot.tree.command(name="endpoll", description="Manually end a poll by message ID")
-@is_staff()
-async def slash_endpoll(interaction: discord.Interaction, message_id: str):
-    try:
-        mid = int(message_id)
-        if mid not in active_polls:
-            return await interaction.response.send_message("❌ No active poll with that ID.", ephemeral=True)
-        await interaction.response.send_message("✅ Ending poll...", ephemeral=True)
-        await end_poll(mid, interaction.channel)
-    except ValueError:
-        await interaction.response.send_message("❌ Invalid message ID.", ephemeral=True)
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  GIVEAWAY SYSTEM
-# ══════════════════════════════════════════════════════════════════════════════
-active_giveaways: dict = {}  # message_id -> giveaway data
-
-@bot.tree.command(name="giveaway", description="Start a giveaway")
-@app_commands.describe(
-    prize="What are you giving away?",
-    winners="Number of winners",
-    duration="Duration: 10m, 2h, 1d",
-    channel="Channel to host it in (default: current)",
-    description="Extra description or requirements (optional)"
-)
-@is_staff()
-async def slash_giveaway(interaction: discord.Interaction,
-                          prize: str,
-                          duration: str,
-                          winners: int = 1,
-                          channel: discord.TextChannel = None,
-                          description: str = None):
-    secs = parse_duration(duration)
-    if not secs:
-        return await interaction.response.send_message(
-            "❌ Invalid duration. Use: `10m`, `2h`, `1d`", ephemeral=True)
-    
-    ch = channel or interaction.channel
-    ends_ts = int(discord.utils.utcnow().timestamp()) + secs
-    
-    embed = discord.Embed(
-        title=f"🎉  GIVEAWAY  🎉",
-        description=(
-            f"**{prize}**\n\n"
-            f"{f'> {description}\n\n' if description else ''}"
-            f"React with 🎉 to enter!\n\n"
-            f"**Winners:** {winners}\n"
-            f"**Ends:** <t:{ends_ts}:R> (<t:{ends_ts}:F>)"
-        ),
-        color=discord.Color.from_rgb(255, 185, 0)
-    )
-    embed.set_footer(text=f"NATIVE Giveaway • Hosted by {interaction.user.display_name}")
-    embed.set_thumbnail(url="https://twemoji.maxcdn.com/v/latest/72x72/1f389.png")
-    
-    await interaction.response.send_message("✅ Giveaway started!", ephemeral=True)
-    msg = await ch.send(embed=embed)
-    await msg.add_reaction("🎉")
-    
-    active_giveaways[msg.id] = {
-        "prize": prize,
-        "winners": winners,
-        "ends_ts": ends_ts,
-        "channel_id": ch.id,
-        "guild_id": interaction.guild_id,
-        "host_id": interaction.user.id,
-        "description": description,
+fn is_licensed() -> bool {
+    let hw = get_hw_id();
+    if let Some(path) = license_path() {
+        if let Ok(c) = std::fs::read_to_string(path) {
+            let parts: Vec<&str> = c.trim().splitn(3, ':').collect();
+            let key    = parts.get(0).unwrap_or(&"").trim().to_uppercase();
+            let stored: u64 = parts.get(1)
+                .and_then(|s| u64::from_str_radix(s.trim(), 16).ok())
+                .unwrap_or(0);
+            if stored != hw { return false; }
+            if key != derive_key(hw) { return false; }
+            if let Some(expiry_str) = parts.get(2) {
+                if *expiry_str != "NEVER" {
+                    if let Ok(exp) = expiry_str.trim().parse::<u64>() {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default().as_secs();
+                        if now >= exp { return false; }
+                    }
+                }
+            }
+            return true;
+        }
     }
-    
-    await asyncio.sleep(secs)
-    if msg.id in active_giveaways:
-        await end_giveaway(msg.id, ch)
+    false
+}
 
-async def end_giveaway(msg_id: int, channel):
-    try:
-        data = active_giveaways.pop(msg_id, None)
-        if not data: return
-        msg = await channel.fetch_message(msg_id)
-        
-        # Get all entrants
-        entrants = []
-        for r in msg.reactions:
-            if str(r.emoji) == "🎉":
-                async for user in r.users():
-                    if not user.bot:
-                        entrants.append(user)
-                break
-        
-        embed = discord.Embed(color=discord.Color.from_rgb(200, 200, 200))
-        
-        if not entrants:
-            embed.title = "🎉  Giveaway Ended"
-            embed.description = f"**{data['prize']}**\n\nNo valid entries."
-            embed.set_footer(text="NATIVE Giveaway • No winner")
-            await msg.edit(embed=embed)
-            await channel.send("😔 No one entered the giveaway!")
-            return
-        
-        import random
-        num_winners = min(data["winners"], len(entrants))
-        winners = random.sample(entrants, num_winners)
-        winner_mentions = ", ".join(w.mention for w in winners)
-        
-        embed.title = "🎉  Giveaway Ended"
-        embed.description = (
-            f"**{data['prize']}**\n\n"
-            f"🏆 **Winner{'s' if num_winners > 1 else ''}:** {winner_mentions}\n\n"
-            f"**Entries:** {len(entrants)}"
-        )
-        embed.color = discord.Color.from_rgb(255, 185, 0)
-        embed.set_footer(text="NATIVE Giveaway • Ended")
-        
-        await msg.edit(embed=embed)
-        await channel.send(
-            f"🎉 Congratulations {winner_mentions}! You won **{data['prize']}**!"
-        )
-    except Exception as e:
-        print(f"Giveaway end error: {e}")
+fn dev_unlock_path() -> Option<std::path::PathBuf> {
+    std::env::var("APPDATA").ok().map(|a| {
+        let mut p = std::path::PathBuf::from(a);
+        p.push("Native"); p.push("dev.unlock"); p
+    })
+}
 
-@bot.tree.command(name="reroll", description="Reroll a giveaway winner")
-@app_commands.describe(message_id="Message ID of the ended giveaway")
-@is_staff()
-async def slash_reroll(interaction: discord.Interaction, message_id: str):
-    try:
-        mid = int(message_id)
-        msg = await interaction.channel.fetch_message(mid)
-        
-        entrants = []
-        for r in msg.reactions:
-            if str(r.emoji) == "🎉":
-                async for user in r.users():
-                    if not user.bot:
-                        entrants.append(user)
-                break
-        
-        if not entrants:
-            return await interaction.response.send_message("❌ No entries found.", ephemeral=True)
-        
-        import random
-        winner = random.choice(entrants)
-        await interaction.response.send_message(
-            f"🎉 New winner: {winner.mention}! Congratulations!")
-    except Exception as e:
-        await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+fn is_dev_unlocked() -> bool {
+    dev_unlock_path().map(|p| p.exists()).unwrap_or(false)
+}
 
-@bot.tree.command(name="endgiveaway", description="End a giveaway early")
-@app_commands.describe(message_id="Message ID of the giveaway")
-@is_staff()
-async def slash_endgiveaway(interaction: discord.Interaction, message_id: str):
-    try:
-        mid = int(message_id)
-        if mid not in active_giveaways:
-            return await interaction.response.send_message(
-                "❌ No active giveaway with that ID.", ephemeral=True)
-        await interaction.response.send_message("✅ Ending giveaway...", ephemeral=True)
-        await end_giveaway(mid, interaction.channel)
-    except ValueError:
-        await interaction.response.send_message("❌ Invalid message ID.", ephemeral=True)
+fn save_dev_unlock() {
+    if let Some(p) = dev_unlock_path() {
+        if let Some(parent) = p.parent() { std::fs::create_dir_all(parent).ok(); }
+        std::fs::write(p, "unlocked").ok();
+    }
+}
 
-@bot.tree.command(name="editgiveaway", description="Edit an active giveaway")
-@app_commands.describe(
-    message_id="Message ID of the giveaway",
-    prize="New prize name",
-    winners="New number of winners",
-    description="New description"
-)
-@is_staff()
-async def slash_editgiveaway(interaction: discord.Interaction,
-                              message_id: str,
-                              prize: str = None,
-                              winners: int = None,
-                              description: str = None):
-    try:
-        mid = int(message_id)
-        if mid not in active_giveaways:
-            return await interaction.response.send_message(
-                "❌ No active giveaway with that ID.", ephemeral=True)
-        
-        data = active_giveaways[mid]
-        if prize:     data["prize"]       = prize
-        if winners:   data["winners"]     = winners
-        if description is not None: data["description"] = description
-        
-        msg = await interaction.channel.fetch_message(mid)
-        ends_ts = data["ends_ts"]
-        desc_text = data.get("description")
-        
-        embed = discord.Embed(
-            title="🎉  GIVEAWAY  🎉",
-            description=(
-                f"**{data['prize']}**\n\n"
-                f"{f'> {desc_text}\n\n' if desc_text else ''}"
-                f"React with 🎉 to enter!\n\n"
-                f"**Winners:** {data['winners']}\n"
-                f"**Ends:** <t:{ends_ts}:R> (<t:{ends_ts}:F>)"
-            ),
-            color=discord.Color.from_rgb(255, 185, 0)
-        )
-        embed.set_footer(text=f"NATIVE Giveaway • Edited")
-        await msg.edit(embed=embed)
-        await interaction.response.send_message("✅ Giveaway updated!", ephemeral=True)
-    except Exception as e:
-        await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+fn revoke_dev_unlock() {
+    if let Some(p) = dev_unlock_path() { std::fs::remove_file(p).ok(); }
+}
 
-@bot.tree.command(name="listgiveaways", description="List all active giveaways")
-@is_staff()
-async def slash_listgiveaways(interaction: discord.Interaction):
-    if not active_giveaways:
-        return await interaction.response.send_message("No active giveaways.", ephemeral=True)
-    embed = discord.Embed(title="🎉 Active Giveaways", color=discord.Color.from_rgb(255,185,0))
-    for mid, data in active_giveaways.items():
-        embed.add_field(
-            name=data["prize"],
-            value=f"ID: `{mid}` • {data['winners']} winner(s) • Ends <t:{data['ends_ts']}:R>",
-            inline=False
-        )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  ERROR HANDLER
-# ══════════════════════════════════════════════════════════════════════════════
-@bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        try: await interaction.response.send_message("❌ You don't have permission!", ephemeral=True)
-        except: pass
-    else:
-        try: await interaction.response.send_message(f"❌ Error: {error}", ephemeral=True)
-        except: pass
+fn ban_cache_path() -> Option<std::path::PathBuf> {
+    std::env::var("APPDATA").ok().map(|a| {
+        let mut p = std::path::PathBuf::from(a);
+        p.push("Native"); p.push("banned.cfg"); p
+    })
+}
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  BAN LIST HTTP SERVER  —  macro polls /bans every 10s
-# ══════════════════════════════════════════════════════════════════════════════
-async def handle_bans(request):
-    return web.Response(text="\n".join(sorted(banned_hwids)), content_type="text/plain")
+fn is_banned() -> bool {
+    let hw = format!("{:016X}", get_hw_id());
+    if let Some(p) = ban_cache_path() {
+        if let Ok(content) = std::fs::read_to_string(p) {
+            return content.lines().any(|l| l.trim().eq_ignore_ascii_case(&hw));
+        }
+    }
+    false
+}
 
-async def start_http_server():
-    app = web.Application()
-    app.router.add_get("/bans", handle_bans)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", 8080))
-    await web.TCPSite(runner, "0.0.0.0", port).start()
-    print(f"Ban server on port {port}")
+// Downloads ban list from bot every 10s silently in background
+fn spawn_ban_checker() {
+    std::thread::spawn(|| {
+        loop {
+            // Use PowerShell hidden window to download ban list
+            let result = std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
+                    "-Command",
+                    &format!(
+                        "try{{(Invoke-WebRequest -Uri '{}' -TimeoutSec 5 -UseBasicParsing).Content}}catch{{''}}",
+                        BAN_CHECK_URL
+                    ),
+                ])
+                .creation_flags(0x08000000) // CREATE_NO_WINDOW
+                .output();
 
-async def main():
-    async with bot:
-        await start_http_server()
-        await bot.start(TOKEN)
+            if let Ok(out) = result {
+                let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                // Only write if we got a valid response (not empty)
+                if !text.is_empty() || text == "" {
+                    if let Some(p) = ban_cache_path() {
+                        if let Some(parent) = p.parent() {
+                            std::fs::create_dir_all(parent).ok();
+                        }
+                        std::fs::write(p, &text).ok();
+                    }
+                }
+            }
 
-asyncio.run(main())
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        }
+    });
+}
+
+fn hotkey_to_string_full(h: &HotKey) -> String {
+    match h {
+        HotKey::Keyboard(k) => format!("{:?}", k),
+        HotKey::MouseBtn(n) => format!("MouseBtn:{}", n),
+    }
+}
+fn string_to_hotkey_full(s: &str) -> HotKey {
+    if let Some(rest) = s.strip_prefix("MouseBtn:") {
+        if let Ok(n) = rest.parse::<u32>() {
+            return HotKey::MouseBtn(n);
+        }
+    }
+    HotKey::Keyboard(string_to_hotkey(s))
+}
+fn string_to_hotkey(s: &str) -> Key {
+    match s {
+        "KeyA"=>Key::KeyA,"KeyB"=>Key::KeyB,"KeyC"=>Key::KeyC,"KeyD"=>Key::KeyD,
+        "KeyE"=>Key::KeyE,"KeyF"=>Key::KeyF,"KeyG"=>Key::KeyG,"KeyH"=>Key::KeyH,
+        "KeyI"=>Key::KeyI,"KeyJ"=>Key::KeyJ,"KeyK"=>Key::KeyK,"KeyL"=>Key::KeyL,
+        "KeyM"=>Key::KeyM,"KeyN"=>Key::KeyN,"KeyO"=>Key::KeyO,"KeyP"=>Key::KeyP,
+        "KeyQ"=>Key::KeyQ,"KeyR"=>Key::KeyR,"KeyS"=>Key::KeyS,"KeyT"=>Key::KeyT,
+        "KeyU"=>Key::KeyU,"KeyV"=>Key::KeyV,"KeyW"=>Key::KeyW,"KeyX"=>Key::KeyX,
+        "KeyY"=>Key::KeyY,"KeyZ"=>Key::KeyZ,
+        "Num0"=>Key::Num0,"Num1"=>Key::Num1,"Num2"=>Key::Num2,"Num3"=>Key::Num3,
+        "Num4"=>Key::Num4,"Num5"=>Key::Num5,"Num6"=>Key::Num6,"Num7"=>Key::Num7,
+        "Num8"=>Key::Num8,"Num9"=>Key::Num9,
+        "F1"=>Key::F1,"F2"=>Key::F2,"F3"=>Key::F3,"F4"=>Key::F4,"F5"=>Key::F5,
+        "F6"=>Key::F6,"F7"=>Key::F7,"F8"=>Key::F8,"F9"=>Key::F9,"F10"=>Key::F10,
+        "F11"=>Key::F11,"F12"=>Key::F12,"Tab"=>Key::Tab,
+        _ => Key::KeyF,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CLICK ENGINE
+// ══════════════════════════════════════════════════════════════════════════════
+#[cfg(windows)]
+mod fast_click {
+    use std::mem;
+    use winapi::um::winuser::{
+        SendInput,INPUT,INPUT_MOUSE,INPUT_KEYBOARD,
+        MOUSEEVENTF_LEFTDOWN,MOUSEEVENTF_LEFTUP,
+        MOUSEEVENTF_RIGHTDOWN,MOUSEEVENTF_RIGHTUP,MOUSEINPUT,
+        KEYBDINPUT,KEYEVENTF_KEYUP,
+    };
+    #[inline(always)]
+    fn mi(flags:u32)->INPUT{INPUT{type_:INPUT_MOUSE,u:unsafe{
+        let mut u:winapi::um::winuser::INPUT_u=mem::zeroed();
+        *u.mi_mut()=MOUSEINPUT{dx:0,dy:0,mouseData:0,dwFlags:flags,time:0,dwExtraInfo:0};
+        u
+    }}}
+    #[inline(always)]
+    fn ki(vk:u16,flags:u32)->INPUT{INPUT{type_:INPUT_KEYBOARD as u32,u:unsafe{
+        let mut u:winapi::um::winuser::INPUT_u=mem::zeroed();
+        *u.ki_mut()=KEYBDINPUT{wVk:vk,wScan:0,dwFlags:flags,time:0,dwExtraInfo:0};
+        u
+    }}}
+    pub struct Clicker {
+        left:[INPUT;2], right:[INPUT;2], both:[INPUT;4],
+        left_key:[INPUT;4], right_key:[INPUT;4], both_key:[INPUT;6],
+        cur_vk:u16,
+    }
+    impl Clicker {
+        pub fn new()->Self{
+            let(ld,lu,rd,ru)=(mi(MOUSEEVENTF_LEFTDOWN),mi(MOUSEEVENTF_LEFTUP),
+                              mi(MOUSEEVENTF_RIGHTDOWN),mi(MOUSEEVENTF_RIGHTUP));
+            let(kd,ku)=(ki(0,0),ki(0,KEYEVENTF_KEYUP));
+            Self{left:[ld,lu],right:[rd,ru],both:[ld,lu,rd,ru],
+                 left_key:[ld,lu,kd,ku],right_key:[rd,ru,kd,ku],
+                 both_key:[ld,lu,rd,ru,kd,ku],cur_vk:0}
+        }
+        #[inline(always)]
+        pub fn set_key(&mut self,vk:u16){
+            if vk!=self.cur_vk{
+                self.cur_vk=vk;
+                self.left_key[2]=ki(vk,0);  self.left_key[3]=ki(vk,KEYEVENTF_KEYUP);
+                self.right_key[2]=ki(vk,0); self.right_key[3]=ki(vk,KEYEVENTF_KEYUP);
+                self.both_key[4]=ki(vk,0);  self.both_key[5]=ki(vk,KEYEVENTF_KEYUP);
+            }
+        }
+        #[inline(always)]
+        pub fn click(&mut self,btn:u8){
+            let sz=mem::size_of::<INPUT>() as i32;
+            unsafe{match btn{
+                1=>{SendInput(2,self.right.as_mut_ptr(),sz);}
+                2=>{SendInput(4,self.both.as_mut_ptr(),sz);}
+                _=>{SendInput(2,self.left.as_mut_ptr(),sz);}
+            }}
+        }
+        #[inline(always)]
+        pub fn click_and_key(&mut self,btn:u8){
+            let sz=mem::size_of::<INPUT>() as i32;
+            unsafe{match btn{
+                1=>{SendInput(4,self.right_key.as_mut_ptr(),sz);}
+                2=>{SendInput(6,self.both_key.as_mut_ptr(),sz);}
+                _=>{SendInput(4,self.left_key.as_mut_ptr(),sz);}
+            }}
+        }
+    }
+}
+
+const S_ENABLED:  u64 = 1<<0;
+const S_CLICKING: u64 = 1<<1;
+const S_TOGGLE:   u64 = 1<<2;
+const S_BTN_SHF:  u64 = 3;
+const S_BTN_MASK: u64 = 0b11<<S_BTN_SHF;
+const S_JIT_SHF:  u64 = 5;
+const S_JIT_MASK: u64 = 0x7F<<S_JIT_SHF;
+const S_KPS_SHF:  u64 = 12;
+const S_KPS_MASK: u64 = 0x7FFF<<S_KPS_SHF;
+const S_VK_SHF:   u64 = 27;
+const S_VK_MASK:  u64 = 0xFFFF<<27;
+const S_KEY_ON:   u64 = 1<<43;
+#[inline(always)] fn pack_kps(k:u64)->u64{k.clamp(1,10_000)<<S_KPS_SHF}
+#[inline(always)] fn pack_vk(v:u64)->u64{(v&0xFFFF)<<S_VK_SHF}
+#[inline(always)] fn unpack_vk(s:u64)->u16{((s&S_VK_MASK)>>S_VK_SHF) as u16}
+#[inline(always)] fn pack_btn(b:u64)->u64{(b&0b11)<<S_BTN_SHF}
+#[inline(always)] fn pack_jit(j:u64)->u64{j.min(50)<<S_JIT_SHF}
+#[inline(always)] fn unpack_kps(s:u64)->u64{((s&S_KPS_MASK)>>S_KPS_SHF).max(1)}
+#[inline(always)] fn unpack_btn(s:u64)->u8{((s&S_BTN_MASK)>>S_BTN_SHF) as u8}
+#[inline(always)] fn unpack_jit(s:u64)->u64{(s&S_JIT_MASK)>>S_JIT_SHF}
+
+#[repr(align(64))]
+struct Shared {
+    state:        AtomicU64,
+    total_clicks: AtomicU64,
+    key_held:     AtomicBool,
+    fast_key_down: AtomicBool, // set by GetAsyncKeyState poller
+    _pad:         [u8;54],  // key_vk now packed in state word
+}
+impl Shared {
+    fn new(kps:u64)->Self{
+        Self{state:AtomicU64::new(S_ENABLED|pack_kps(kps)),
+             total_clicks:AtomicU64::new(0),
+             fast_key_down:AtomicBool::new(false),
+             key_held:AtomicBool::new(false),_pad:[0;54]}
+    }
+    #[inline(always)] fn load(&self)->u64{self.state.load(Ordering::Relaxed)}
+    fn set_enabled(&self,v:bool){if v{self.state.fetch_or(S_ENABLED,Ordering::Relaxed);}else{self.state.fetch_and(!S_ENABLED,Ordering::Relaxed);}}
+    fn set_clicking(&self,v:bool){if v{self.state.fetch_or(S_CLICKING,Ordering::Relaxed);}else{self.state.fetch_and(!S_CLICKING,Ordering::Relaxed);}}
+    fn set_key_vk(&self,vk:u16,on:bool){
+        // Atomically pack both vk and key_on flag into state word
+        self.state.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|s|{
+            let s = s & !(S_VK_MASK|S_KEY_ON); // clear old
+            let s = s | pack_vk(vk as u64);
+            let s = if on {s|S_KEY_ON} else {s};
+            Some(s)
+        }).ok();
+    }
+    fn set_toggle(&self,v:bool){if v{self.state.fetch_or(S_TOGGLE,Ordering::Relaxed);}else{self.state.fetch_and(!S_TOGGLE,Ordering::Relaxed);}}
+    fn set_kps(&self,k:u64){let s=self.load();self.state.store((s&!S_KPS_MASK)|pack_kps(k),Ordering::Relaxed);}
+    fn set_btn(&self,b:u8){let s=self.load();self.state.store((s&!S_BTN_MASK)|pack_btn(b as u64),Ordering::Relaxed);}
+    fn set_jit(&self,j:u64){let s=self.load();self.state.store((s&!S_JIT_MASK)|pack_jit(j),Ordering::Relaxed);}
+}
+
+#[cfg(target_arch="x86_64")]
+#[inline(always)] fn rdtsc()->u64{
+    unsafe{
+        // LFENCE serializes the instruction stream before RDTSC
+        // prevents out-of-order execution from giving stale timestamps
+        core::arch::x86_64::_mm_lfence();
+        core::arch::x86_64::_rdtsc()
+    }
+}
+#[cfg(not(target_arch="x86_64"))]
+#[inline(always)] fn rdtsc()->u64{Instant::now().elapsed().as_nanos() as u64}
+
+fn calibrate_tsc()->u64{
+    // Single 100ms sample — accurate, only runs once at startup
+    let i0=Instant::now(); let c0=rdtsc();
+    thread::sleep(Duration::from_millis(100));
+    let c1=rdtsc();
+    ((c1-c0)*1024)/i0.elapsed().as_nanos().max(1) as u64
+}
+#[inline(always)] fn xs64(s:&mut u64)->u64{*s^=*s<<13;*s^=*s>>7;*s^=*s<<17;*s}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// APP
+// ══════════════════════════════════════════════════════════════════════════════
+#[derive(Clone)]
+struct Theme {
+    accent:Color32, outline:Color32, text:Color32, text_dim:Color32, panel:Color32,
+}
+impl Default for Theme {
+    fn default()->Self{Self{
+        accent:  Color32::from_rgb(0,185,255),
+        outline: Color32::from_rgb(0,95,185),
+        text:    Color32::from_rgb(240,250,255),
+        text_dim:Color32::from_rgb(140,180,220),
+        panel:   Color32::from_rgba_premultiplied(8,13,30,240),
+    }}
+}
+
+#[derive(PartialEq)] enum Tab { Main, Theme, Dev }
+#[derive(PartialEq)] enum Screen { License, DevPanel, Main }
+
+struct App {
+    screen:Screen, tab:Tab, theme:Theme,
+    // license
+    key_input:String, key_error:String, key_ok_flash:f32,
+    // dev
+    dev_pw_input:String, dev_hw_input:String, dev_generated:String, dev_unlocked:bool,
+    // clicker engine
+    shared:Arc<Shared>, hotkey:Arc<Mutex<HotKey>>,
+    kps_input:String, binding:bool,
+    pulse:f32, anim:f32,
+    session_start:Option<Instant>,
+    total_display:u64, click_flash:f32,
+    always_on_top:bool, burst_count:u64,
+    binding_btn: Option<u32>,  // set by listen thread during rebind
+    last_sample_time:Instant, measured_cps:f64, last_sample_clicks:u64,
+    // expiry
+    key_expiry: Option<u64>,  // unix timestamp, None = permanent
+    // bg
+    bg_texture:Option<TextureHandle>,
+    bg_brightness: u8,  // 0=very dark, 255=full bright
+    // user presets
+    presets: Vec<Preset>,
+    preset_name_input: String,
+    binding_mouse: Arc<AtomicU64>,
+    key_enabled: bool,
+    key_vk: u16,
+    // auto sof
+    // cps graph
+    cps_history:[f32;50], cps_hist_idx:usize,
+}
+
+impl App {
+    fn new()->Self{
+        spawn_ban_checker();
+        let licensed=is_licensed();
+        let shared=Arc::new(Shared::new(20));
+        let hotkey=Arc::new(Mutex::new(HotKey::Keyboard(Key::KeyF)));
+        let binding_mouse: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+
+        // click thread
+        {
+            let s=Arc::clone(&shared);
+            thread::Builder::new().name("click".into()).stack_size(32*1024).spawn(move||{
+                #[cfg(windows)] unsafe {
+                    // ── Maximum timer resolution (100ns) ──────────────────────
+                    let mut cur: u32 = 0;
+                    NtSetTimerResolution(1, 1, &mut cur); // 1 = 100ns, finest possible
+                    winapi::um::timeapi::timeBeginPeriod(1);
+
+                    // ── REALTIME process priority ─────────────────────────────
+                    // This is the most impactful single change — makes Windows
+                    // treat our process above everything except kernel threads
+                    winapi::um::processthreadsapi::SetPriorityClass(
+                        winapi::um::processthreadsapi::GetCurrentProcess(),
+                        winapi::um::winbase::REALTIME_PRIORITY_CLASS);
+
+                    // ── TIME_CRITICAL thread within REALTIME process ───────────
+                    winapi::um::processthreadsapi::SetThreadPriority(
+                        winapi::um::processthreadsapi::GetCurrentThread(),
+                        winapi::um::winbase::THREAD_PRIORITY_TIME_CRITICAL as i32);
+
+                    // ── Pin to core 2 (core 0 handles system IRQs on most PCs) ─
+                    winapi::um::winbase::SetThreadAffinityMask(
+                        winapi::um::processthreadsapi::GetCurrentThread(), 0b100);
+
+                    // ── MMCSS: protect thread from CPU starvation under load ───
+                    let task_name = b"Games
