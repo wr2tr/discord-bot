@@ -744,6 +744,324 @@ async def slash_8ball(interaction: discord.Interaction, question: str):
     embed.add_field(name="Answer",   value=random.choice(["Yes.", "No."]), inline=False)
     await interaction.response.send_message(embed=embed)
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  POLL SYSTEM
+# ══════════════════════════════════════════════════════════════════════════════
+active_polls: dict = {}  # message_id -> poll data
+
+@bot.tree.command(name="poll", description="Create a poll with up to 4 options")
+@app_commands.describe(
+    question="The poll question",
+    option1="First option",
+    option2="Second option",
+    option3="Third option (optional)",
+    option4="Fourth option (optional)",
+    duration="Duration in minutes (0 = no end, default 0)"
+)
+async def slash_poll(interaction: discord.Interaction,
+                     question: str,
+                     option1: str,
+                     option2: str,
+                     option3: str = None,
+                     option4: str = None,
+                     duration: int = 0):
+    options = [o for o in [option1, option2, option3, option4] if o]
+    emojis  = ["🔵", "🟢", "🟡", "🔴"]
+    
+    embed = discord.Embed(
+        title=f"📊  {question}",
+        color=discord.Color.from_rgb(0, 185, 255)
+    )
+    embed.set_footer(text=f"NATIVE Poll • React to vote{f' • Ends in {duration}m' if duration else ''}")
+    
+    desc = ""
+    for i, opt in enumerate(options):
+        desc += f"{emojis[i]}  **{opt}**\n\n"
+    embed.description = desc.strip()
+    
+    if duration:
+        ends = discord.utils.utcnow() + datetime.timedelta(minutes=duration)
+        embed.add_field(name="⏱️ Ends", value=f"<t:{int(ends.timestamp())}:R>", inline=False)
+    
+    await interaction.response.send_message(embed=embed)
+    msg = await interaction.original_response()
+    
+    for i in range(len(options)):
+        await msg.add_reaction(emojis[i])
+    
+    poll_data = {
+        "question": question,
+        "options": options,
+        "emojis": emojis[:len(options)],
+        "channel_id": interaction.channel_id,
+        "guild_id": interaction.guild_id,
+        "ends": (discord.utils.utcnow() + datetime.timedelta(minutes=duration)).isoformat() if duration else None
+    }
+    active_polls[msg.id] = poll_data
+    
+    if duration:
+        await asyncio.sleep(duration * 60)
+        if msg.id in active_polls:
+            await end_poll(msg.id, interaction.channel)
+
+async def end_poll(msg_id: int, channel):
+    try:
+        data = active_polls.pop(msg_id, None)
+        if not data: return
+        msg = await channel.fetch_message(msg_id)
+        
+        # Count votes
+        results = []
+        total = 0
+        for i, emoji in enumerate(data["emojis"]):
+            for r in msg.reactions:
+                if str(r.emoji) == emoji:
+                    count = r.count - 1  # subtract bot reaction
+                    results.append((data["options"][i], count, emoji))
+                    total += count
+                    break
+            else:
+                results.append((data["options"][i], 0, emoji))
+        
+        results.sort(key=lambda x: x[1], reverse=True)
+        winner = results[0]
+        
+        embed = discord.Embed(
+            title=f"📊  Poll Ended — {data['question']}",
+            color=discord.Color.from_rgb(0, 220, 100)
+        )
+        desc = ""
+        for opt, count, emoji in results:
+            pct = round((count / total * 100) if total else 0)
+            bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+            bold = "**" if opt == winner[0] else ""
+            desc += f"{emoji}  {bold}{opt}{bold}\n`{bar}` {pct}% ({count} votes)\n\n"
+        embed.description = desc.strip()
+        embed.set_footer(text=f"NATIVE Poll • {total} total votes • Winner: {winner[0]}")
+        
+        await msg.edit(embed=embed)
+        await channel.send(f"📊 Poll ended! **{winner[0]}** wins with **{winner[1]} votes**!")
+    except Exception as e:
+        print(f"Poll end error: {e}")
+
+@bot.tree.command(name="endpoll", description="Manually end a poll by message ID")
+@is_staff()
+async def slash_endpoll(interaction: discord.Interaction, message_id: str):
+    try:
+        mid = int(message_id)
+        if mid not in active_polls:
+            return await interaction.response.send_message("❌ No active poll with that ID.", ephemeral=True)
+        await interaction.response.send_message("✅ Ending poll...", ephemeral=True)
+        await end_poll(mid, interaction.channel)
+    except ValueError:
+        await interaction.response.send_message("❌ Invalid message ID.", ephemeral=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GIVEAWAY SYSTEM
+# ══════════════════════════════════════════════════════════════════════════════
+active_giveaways: dict = {}  # message_id -> giveaway data
+
+@bot.tree.command(name="giveaway", description="Start a giveaway")
+@app_commands.describe(
+    prize="What are you giving away?",
+    winners="Number of winners",
+    duration="Duration: 10m, 2h, 1d",
+    channel="Channel to host it in (default: current)",
+    description="Extra description or requirements (optional)"
+)
+@is_staff()
+async def slash_giveaway(interaction: discord.Interaction,
+                          prize: str,
+                          duration: str,
+                          winners: int = 1,
+                          channel: discord.TextChannel = None,
+                          description: str = None):
+    secs = parse_duration(duration)
+    if not secs:
+        return await interaction.response.send_message(
+            "❌ Invalid duration. Use: `10m`, `2h`, `1d`", ephemeral=True)
+    
+    ch = channel or interaction.channel
+    ends_ts = int(discord.utils.utcnow().timestamp()) + secs
+    
+    embed = discord.Embed(
+        title=f"🎉  GIVEAWAY  🎉",
+        description=(
+            f"**{prize}**\n\n"
+            f"{f'> {description}\n\n' if description else ''}"
+            f"React with 🎉 to enter!\n\n"
+            f"**Winners:** {winners}\n"
+            f"**Ends:** <t:{ends_ts}:R> (<t:{ends_ts}:F>)"
+        ),
+        color=discord.Color.from_rgb(255, 185, 0)
+    )
+    embed.set_footer(text=f"NATIVE Giveaway • Hosted by {interaction.user.display_name}")
+    embed.set_thumbnail(url="https://twemoji.maxcdn.com/v/latest/72x72/1f389.png")
+    
+    await interaction.response.send_message("✅ Giveaway started!", ephemeral=True)
+    msg = await ch.send(embed=embed)
+    await msg.add_reaction("🎉")
+    
+    active_giveaways[msg.id] = {
+        "prize": prize,
+        "winners": winners,
+        "ends_ts": ends_ts,
+        "channel_id": ch.id,
+        "guild_id": interaction.guild_id,
+        "host_id": interaction.user.id,
+        "description": description,
+    }
+    
+    await asyncio.sleep(secs)
+    if msg.id in active_giveaways:
+        await end_giveaway(msg.id, ch)
+
+async def end_giveaway(msg_id: int, channel):
+    try:
+        data = active_giveaways.pop(msg_id, None)
+        if not data: return
+        msg = await channel.fetch_message(msg_id)
+        
+        # Get all entrants
+        entrants = []
+        for r in msg.reactions:
+            if str(r.emoji) == "🎉":
+                async for user in r.users():
+                    if not user.bot:
+                        entrants.append(user)
+                break
+        
+        embed = discord.Embed(color=discord.Color.from_rgb(200, 200, 200))
+        
+        if not entrants:
+            embed.title = "🎉  Giveaway Ended"
+            embed.description = f"**{data['prize']}**\n\nNo valid entries."
+            embed.set_footer(text="NATIVE Giveaway • No winner")
+            await msg.edit(embed=embed)
+            await channel.send("😔 No one entered the giveaway!")
+            return
+        
+        import random
+        num_winners = min(data["winners"], len(entrants))
+        winners = random.sample(entrants, num_winners)
+        winner_mentions = ", ".join(w.mention for w in winners)
+        
+        embed.title = "🎉  Giveaway Ended"
+        embed.description = (
+            f"**{data['prize']}**\n\n"
+            f"🏆 **Winner{'s' if num_winners > 1 else ''}:** {winner_mentions}\n\n"
+            f"**Entries:** {len(entrants)}"
+        )
+        embed.color = discord.Color.from_rgb(255, 185, 0)
+        embed.set_footer(text="NATIVE Giveaway • Ended")
+        
+        await msg.edit(embed=embed)
+        await channel.send(
+            f"🎉 Congratulations {winner_mentions}! You won **{data['prize']}**!"
+        )
+    except Exception as e:
+        print(f"Giveaway end error: {e}")
+
+@bot.tree.command(name="reroll", description="Reroll a giveaway winner")
+@app_commands.describe(message_id="Message ID of the ended giveaway")
+@is_staff()
+async def slash_reroll(interaction: discord.Interaction, message_id: str):
+    try:
+        mid = int(message_id)
+        msg = await interaction.channel.fetch_message(mid)
+        
+        entrants = []
+        for r in msg.reactions:
+            if str(r.emoji) == "🎉":
+                async for user in r.users():
+                    if not user.bot:
+                        entrants.append(user)
+                break
+        
+        if not entrants:
+            return await interaction.response.send_message("❌ No entries found.", ephemeral=True)
+        
+        import random
+        winner = random.choice(entrants)
+        await interaction.response.send_message(
+            f"🎉 New winner: {winner.mention}! Congratulations!")
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+
+@bot.tree.command(name="endgiveaway", description="End a giveaway early")
+@app_commands.describe(message_id="Message ID of the giveaway")
+@is_staff()
+async def slash_endgiveaway(interaction: discord.Interaction, message_id: str):
+    try:
+        mid = int(message_id)
+        if mid not in active_giveaways:
+            return await interaction.response.send_message(
+                "❌ No active giveaway with that ID.", ephemeral=True)
+        await interaction.response.send_message("✅ Ending giveaway...", ephemeral=True)
+        await end_giveaway(mid, interaction.channel)
+    except ValueError:
+        await interaction.response.send_message("❌ Invalid message ID.", ephemeral=True)
+
+@bot.tree.command(name="editgiveaway", description="Edit an active giveaway")
+@app_commands.describe(
+    message_id="Message ID of the giveaway",
+    prize="New prize name",
+    winners="New number of winners",
+    description="New description"
+)
+@is_staff()
+async def slash_editgiveaway(interaction: discord.Interaction,
+                              message_id: str,
+                              prize: str = None,
+                              winners: int = None,
+                              description: str = None):
+    try:
+        mid = int(message_id)
+        if mid not in active_giveaways:
+            return await interaction.response.send_message(
+                "❌ No active giveaway with that ID.", ephemeral=True)
+        
+        data = active_giveaways[mid]
+        if prize:     data["prize"]       = prize
+        if winners:   data["winners"]     = winners
+        if description is not None: data["description"] = description
+        
+        msg = await interaction.channel.fetch_message(mid)
+        ends_ts = data["ends_ts"]
+        desc_text = data.get("description")
+        
+        embed = discord.Embed(
+            title="🎉  GIVEAWAY  🎉",
+            description=(
+                f"**{data['prize']}**\n\n"
+                f"{f'> {desc_text}\n\n' if desc_text else ''}"
+                f"React with 🎉 to enter!\n\n"
+                f"**Winners:** {data['winners']}\n"
+                f"**Ends:** <t:{ends_ts}:R> (<t:{ends_ts}:F>)"
+            ),
+            color=discord.Color.from_rgb(255, 185, 0)
+        )
+        embed.set_footer(text=f"NATIVE Giveaway • Edited")
+        await msg.edit(embed=embed)
+        await interaction.response.send_message("✅ Giveaway updated!", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+
+@bot.tree.command(name="listgiveaways", description="List all active giveaways")
+@is_staff()
+async def slash_listgiveaways(interaction: discord.Interaction):
+    if not active_giveaways:
+        return await interaction.response.send_message("No active giveaways.", ephemeral=True)
+    embed = discord.Embed(title="🎉 Active Giveaways", color=discord.Color.from_rgb(255,185,0))
+    for mid, data in active_giveaways.items():
+        embed.add_field(
+            name=data["prize"],
+            value=f"ID: `{mid}` • {data['winners']} winner(s) • Ends <t:{data['ends_ts']}:R>",
+            inline=False
+        )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ERROR HANDLER
 # ══════════════════════════════════════════════════════════════════════════════
